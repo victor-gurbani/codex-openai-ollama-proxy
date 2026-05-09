@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from codex_openai_ollama_proxy.core.config import Settings
 from codex_openai_ollama_proxy.core.debug_trace import log_debug_event
@@ -12,6 +13,7 @@ from codex_openai_ollama_proxy.services.model_resolution import (
     FALLBACK_BASE_MODELS,
     exposed_model_list,
     is_known_model,
+    resolve_model_alias,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -31,6 +33,7 @@ class ModelCatalogService:
         self._time_fn = time_fn or time.monotonic
         self._fallback_base_models = list(fallback_base_models)
         self._cached_base_models: list[str] | None = None
+        self._cached_model_metadata: dict[str, dict[str, Any]] | None = None
         self._cache_expires_at = 0.0
         self._lock = asyncio.Lock()
 
@@ -58,9 +61,19 @@ class ModelCatalogService:
         base_models = await self.get_base_models()
         return exposed_model_list(base_models)
 
+    async def get_model_metadata_for_request(
+        self, request_model: str
+    ) -> dict[str, Any] | None:
+        base_models = await self.get_base_models_for_request(request_model)
+        backend_model, _ = resolve_model_alias(request_model, base_models)
+        if not self._cached_model_metadata:
+            return None
+        metadata = self._cached_model_metadata.get(backend_model)
+        return dict(metadata) if metadata is not None else None
+
     async def _refresh_or_fallback_locked(self) -> list[str]:
         try:
-            base_models = await self._backend_client.fetch_codex_model_slugs(
+            models = await self._backend_client.fetch_codex_models(
                 client_version=self._settings.backend_models_client_version
             )
         except Exception as exc:  # noqa: BLE001
@@ -77,6 +90,7 @@ class ModelCatalogService:
                 )
                 return list(self._cached_base_models)
 
+            self._cached_model_metadata = None
             LOGGER.warning(
                 "Model catalog refresh failed; using static fallback models: %s",
                 exc,
@@ -89,7 +103,11 @@ class ModelCatalogService:
             )
             return list(self._fallback_base_models)
 
+        base_models = [str(model["slug"]) for model in models]
         self._cached_base_models = base_models
+        self._cached_model_metadata = {
+            str(model["slug"]): dict(model) for model in models
+        }
         self._cache_expires_at = self._time_fn() + self._settings.model_catalog_ttl_seconds
         log_debug_event(
             "model_catalog_fetch",

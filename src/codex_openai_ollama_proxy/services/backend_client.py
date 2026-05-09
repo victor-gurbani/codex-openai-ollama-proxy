@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -161,7 +162,7 @@ class BackendClient:
 
         return response
 
-    async def fetch_codex_model_slugs(self, client_version: str) -> list[str]:
+    async def fetch_codex_models(self, client_version: str) -> list[dict[str, Any]]:
         auth_snapshot = await self._auth_store.snapshot()
         response = await self._send_model_catalog_request(client_version, auth_snapshot)
 
@@ -192,25 +193,31 @@ class BackendClient:
         if not isinstance(models, list):
             raise BackendHTTPError(response.status_code, "Invalid model catalog response")
 
-        slugs: list[str] = []
+        normalized_models: list[dict[str, Any]] = []
         seen: set[str] = set()
         for model in models:
-            slug = model.get("slug") if isinstance(model, dict) else None
+            if not isinstance(model, dict):
+                continue
+            slug = model.get("slug")
             if not isinstance(slug, str) or not slug or slug in seen:
                 continue
             seen.add(slug)
-            slugs.append(slug)
+            normalized_models.append(dict(model))
 
-        if not slugs:
+        if not normalized_models:
             raise BackendHTTPError(response.status_code, "Empty model catalog response")
 
         log_debug_event(
             "backend_model_catalog_response",
             status_code=response.status_code,
-            slugs=slugs,
+            slugs=[model["slug"] for model in normalized_models],
             client_version=client_version,
         )
-        return slugs
+        return normalized_models
+
+    async def fetch_codex_model_slugs(self, client_version: str) -> list[str]:
+        models = await self.fetch_codex_models(client_version)
+        return [str(model["slug"]) for model in models]
 
     async def _send(
         self,

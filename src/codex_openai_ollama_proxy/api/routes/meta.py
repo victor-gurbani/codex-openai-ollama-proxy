@@ -9,9 +9,9 @@ from codex_openai_ollama_proxy.core.config import Settings
 router = APIRouter(tags=["meta"])
 
 
-@router.get("/api/version")
+@router.api_route("/api/version", methods=["GET", "HEAD"])
 def api_version(settings: Settings = Depends(get_settings)) -> dict[str, str]:
-    return {"version": settings.service_version}
+    return {"version": settings.ollama_compat_version}
 
 
 @router.get("/chat-test", include_in_schema=False)

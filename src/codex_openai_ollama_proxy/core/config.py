@@ -14,6 +14,7 @@ DEFAULT_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 DEFAULT_BACKEND_MODELS_CLIENT_VERSION = "9.9.9"
 DEFAULT_MODEL_CATALOG_TTL_SECONDS = 300.0
 DEFAULT_STREAM_IDLE_HEARTBEAT_SECONDS = 15.0
+DEFAULT_OLLAMA_COMPAT_VERSION = "0.22.0"
 OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DEFAULT_SYSTEM_INSTRUCTIONS = (
     "You are a helpful AI assistant. Provide clear, accurate, and concise responses "
@@ -87,6 +88,7 @@ class Settings:
     codex_client_id: str = OPENAI_CODEX_CLIENT_ID
     service_name: str = "codex-openai-ollama-proxy"
     service_version: str = "0.1.0"
+    ollama_compat_version: str = DEFAULT_OLLAMA_COMPAT_VERSION
     public_paths: frozenset[str] = field(
         default_factory=lambda: frozenset(
             {"/health", "/api/tags", "/chat-test", "/chat-test.html"}
@@ -131,6 +133,10 @@ class Settings:
             or DEFAULT_BACKEND_MODELS_CLIENT_VERSION
         )
         oauth_token_url = os.getenv("CODEX_OAUTH_TOKEN_URL") or DEFAULT_OAUTH_TOKEN_URL
+        ollama_compat_version = (
+            normalize_optional(os.getenv("OLLAMA_COMPAT_VERSION"))
+            or DEFAULT_OLLAMA_COMPAT_VERSION
+        )
 
         return cls(
             port=port,
@@ -144,4 +150,5 @@ class Settings:
             backend_models_url=backend_models_url,
             backend_models_client_version=backend_models_client_version,
             oauth_token_url=oauth_token_url,
+            ollama_compat_version=ollama_compat_version,
         )

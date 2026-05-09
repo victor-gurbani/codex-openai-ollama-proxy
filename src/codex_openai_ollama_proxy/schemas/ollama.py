@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from .openai import ChatMessage
 
@@ -57,3 +57,9 @@ class OllamaGenerateRequest(BaseModel):
     @classmethod
     def _validate_think(cls, value: Any) -> bool | str | None:
         return validate_ollama_think(value)
+
+
+class OllamaShowRequest(BaseModel):
+    model: str = Field(validation_alias=AliasChoices("model", "name"))
+
+    model_config = ConfigDict(extra="allow")

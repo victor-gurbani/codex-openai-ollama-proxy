@@ -16,6 +16,16 @@ class TextDoneEvent:
 
 
 @dataclass(slots=True)
+class ThinkingDeltaEvent:
+    text: str
+
+
+@dataclass(slots=True)
+class ThinkingDoneEvent:
+    text: str
+
+
+@dataclass(slots=True)
 class ToolCallChunkEvent:
     item_id: str
     index: int
@@ -34,6 +44,18 @@ class UsageEvent:
 @dataclass(slots=True)
 class ErrorEvent:
     message: str
+    status_code: int = 502
+    error_type: str | None = None
+    param: str | None = None
+    code: str | None = None
 
 
-StreamEvent = TextDeltaEvent | TextDoneEvent | ToolCallChunkEvent | UsageEvent | ErrorEvent
+StreamEvent = (
+    TextDeltaEvent
+    | TextDoneEvent
+    | ThinkingDeltaEvent
+    | ThinkingDoneEvent
+    | ToolCallChunkEvent
+    | UsageEvent
+    | ErrorEvent
+)

@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 
 from codex_openai_ollama_proxy.schemas.events import (
     StreamEvent,
+    ThinkingDeltaEvent,
+    ThinkingDoneEvent,
     TextDeltaEvent,
     TextDoneEvent,
     ToolCallChunkEvent,
@@ -33,8 +35,10 @@ class ToolCallSnapshot:
 @dataclass(slots=True)
 class StreamState:
     text: str = ""
+    thinking: str = ""
     usage: Usage | None = None
     saw_text_delta: bool = False
+    saw_thinking_delta: bool = False
     _tool_calls_by_item: dict[str, ToolCallSnapshot] = field(default_factory=dict)
 
     def apply(self, event: StreamEvent) -> bool:
@@ -47,6 +51,17 @@ class StreamState:
             if self.saw_text_delta:
                 return False
             self.text += event.text
+            return True
+
+        if isinstance(event, ThinkingDeltaEvent):
+            self.thinking += event.text
+            self.saw_thinking_delta = True
+            return True
+
+        if isinstance(event, ThinkingDoneEvent):
+            if self.saw_thinking_delta:
+                return False
+            self.thinking += event.text
             return True
 
         if isinstance(event, ToolCallChunkEvent):
@@ -84,6 +99,10 @@ class StreamState:
 
     @property
     def has_any_output(self) -> bool:
+        return bool(self.text or self.thinking or self._tool_calls_by_item)
+
+    @property
+    def has_visible_openai_output(self) -> bool:
         return bool(self.text or self._tool_calls_by_item)
 
     @property

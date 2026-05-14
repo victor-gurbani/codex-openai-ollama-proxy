@@ -150,3 +150,166 @@ def test_ollama_chat_streaming_emits_incremental_tool_call_snapshots(tmp_path: P
     assert any('"arguments":"{\\"path\\""' in line for line in tool_lines)
     assert any('"arguments":{"path":"."}' in line for line in tool_lines)
     assert '"done":true' in lines[-1]
+
+
+def test_ollama_chat_streaming_emits_thinking_chunks(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"Thinking..."}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Answer"}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-5.4:latest",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                    "think": True,
+                },
+            )
+
+    assert response.status_code == 200
+    lines = [line for line in response.text.splitlines() if line.strip()]
+
+    assert any('"thinking":"Thinking..."' in line for line in lines)
+    assert any('"content":"Answer"' in line for line in lines)
+    assert '"done":true' in lines[-1]
+
+
+def test_ollama_generate_streaming_emits_thinking_chunks(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"Thinking..."}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Answer"}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/generate",
+                json={
+                    "model": "gpt-5.4:latest",
+                    "prompt": "hello",
+                    "stream": True,
+                    "think": True,
+                },
+            )
+
+    assert response.status_code == 200
+    lines = [line for line in response.text.splitlines() if line.strip()]
+
+    assert any('"thinking":"Thinking..."' in line for line in lines)
+    assert any('"response":"Answer"' in line for line in lines)
+    assert '"done":true' in lines[-1]
+
+
+def test_ollama_chat_streaming_thinking_and_tool_calls_can_coexist(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"Thinking..."}\n\n'
+        'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"list_files","arguments":"{\\"path\\":\\".\\"}"}}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-5.4:latest",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                    "think": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "list_files",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+    assert response.status_code == 200
+    lines = [line for line in response.text.splitlines() if line.strip()]
+
+    assert any('"thinking":"Thinking..."' in line for line in lines)
+    assert any('"tool_calls"' in line for line in lines)
+    assert '"done":true' in lines[-1]
+
+
+def test_ollama_chat_streaming_emits_final_tool_call_snapshot_once(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_1","name":"list_files"}}\n\n'
+        'data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"list_files","arguments":"{\\"path\\":\\".\\"}"}}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-5.4:latest",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "list_files",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                },
+            )
+
+    assert response.status_code == 200
+    lines = [line for line in response.text.splitlines() if line.strip()]
+
+    tool_lines = [line for line in lines if '"tool_calls"' in line]
+    assert len(tool_lines) == 2
+    assert '"arguments":{}' in tool_lines[0]
+    assert '"arguments":{"path":"."}' in tool_lines[1]
+    assert '"done":true' in lines[-1]

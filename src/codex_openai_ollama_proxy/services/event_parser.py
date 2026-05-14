@@ -6,9 +6,12 @@ import json
 from typing import Any
 from uuid import uuid4
 
-from codex_openai_ollama_proxy.core.errors import EmptyBackendResponseError
+from codex_openai_ollama_proxy.core.errors import BackendSSEError, EmptyBackendResponseError
 from codex_openai_ollama_proxy.schemas.events import (
+    ErrorEvent,
     StreamEvent,
+    ThinkingDeltaEvent,
+    ThinkingDoneEvent,
     TextDeltaEvent,
     TextDoneEvent,
     ToolCallChunkEvent,
@@ -33,18 +36,141 @@ class BackendEventParser:
         self._function_calls: dict[str, FunctionCallState] = {}
         self._next_tool_index = 0
 
-    def parse_event(self, event: dict[str, Any]) -> list[StreamEvent]:
+    @staticmethod
+    def _status_code_from_error(
+        *,
+        error_type: str | None,
+        code: str | None,
+        message: str,
+        status_code: int | None,
+    ) -> int:
+        if status_code is not None and 400 <= status_code <= 599:
+            return status_code
+        normalized_type = (error_type or "").strip().lower()
+        normalized_code = (code or "").strip().lower()
+        normalized_message = message.strip().lower()
+        if normalized_type == "invalid_request_error" or normalized_code == "context_length_exceeded":
+            return 400
+        if "context window" in normalized_message or "input exceeds the context window" in normalized_message:
+            return 400
+        if normalized_type in {"authentication_error", "invalid_api_key_error"}:
+            return 401
+        if normalized_code in {"rate_limit_exceeded", "insufficient_quota"}:
+            return 429
+        return 502
+
+    def _parse_error_event(
+        self, event: dict[str, Any], *, sse_event_name: str | None = None
+    ) -> ErrorEvent | None:
+        event_type = event.get("type") or sse_event_name
+        error_type: str | None = None
+        code: str | None = None
+        param: str | None = None
+        message: str | None = None
+        status_code: int | None = parse_optional_int(event.get("status_code"))
+
+        error_obj = event.get("error")
+        if isinstance(error_obj, str):
+            message = error_obj
+        elif isinstance(error_obj, dict):
+            message = error_obj.get("message") if isinstance(error_obj.get("message"), str) else None
+            error_type = error_obj.get("type") if isinstance(error_obj.get("type"), str) else None
+            code = error_obj.get("code") if isinstance(error_obj.get("code"), str) else None
+            param = error_obj.get("param") if isinstance(error_obj.get("param"), str) else None
+            status_code = parse_optional_int(error_obj.get("status_code")) or status_code
+
+        response_obj = event.get("response")
+        if isinstance(response_obj, dict):
+            response_error = response_obj.get("error")
+            if isinstance(response_error, dict):
+                message = message or (
+                    response_error.get("message")
+                    if isinstance(response_error.get("message"), str)
+                    else None
+                )
+                error_type = error_type or (
+                    response_error.get("type")
+                    if isinstance(response_error.get("type"), str)
+                    else None
+                )
+                code = code or (
+                    response_error.get("code")
+                    if isinstance(response_error.get("code"), str)
+                    else None
+                )
+                param = param or (
+                    response_error.get("param")
+                    if isinstance(response_error.get("param"), str)
+                    else None
+                )
+                status_code = parse_optional_int(response_error.get("status_code")) or status_code
+
+        if error_type is None and isinstance(event.get("type"), str):
+            event_type_value = event.get("type")
+            if event_type_value != "response.failed":
+                error_type = event_type_value
+
+        if code is None and isinstance(event.get("code"), str):
+            code = event.get("code")
+
+        if param is None and isinstance(event.get("param"), str):
+            param = event.get("param")
+
+        if message is None:
+            event_message = event.get("message")
+            if isinstance(event_message, str):
+                message = event_message
+
+        if message is None and event_type in {"error", "response.failed"}:
+            message = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+
+        if message is None:
+            return None
+
+        return ErrorEvent(
+            message=message,
+            status_code=self._status_code_from_error(
+                error_type=error_type,
+                code=code,
+                message=message,
+                status_code=status_code,
+            ),
+            error_type=error_type,
+            param=param,
+            code=code,
+        )
+
+    def parse_event(
+        self, event: dict[str, Any], *, sse_event_name: str | None = None
+    ) -> list[StreamEvent]:
         parsed_events: list[StreamEvent] = []
 
         parsed_usage = extract_usage_from_event(event)
         if parsed_usage is not None:
             parsed_events.append(UsageEvent(parsed_usage))
 
-        event_type = event.get("type")
+        error_event = self._parse_error_event(event, sse_event_name=sse_event_name)
+        if error_event is not None:
+            parsed_events.append(error_event)
+            return parsed_events
+
+        event_type = event.get("type") or sse_event_name
         if event_type == "response.output_text.delta":
             delta = event.get("delta")
             if isinstance(delta, str):
                 parsed_events.append(TextDeltaEvent(delta))
+            return parsed_events
+
+        if event_type == "response.reasoning_summary_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                parsed_events.append(ThinkingDeltaEvent(delta))
+            return parsed_events
+
+        if event_type == "response.reasoning_summary_text.done":
+            text = event.get("text")
+            if isinstance(text, str):
+                parsed_events.append(ThinkingDoneEvent(text))
             return parsed_events
 
         if event_type == "response.output_item.added":
@@ -72,6 +198,11 @@ class BackendEventParser:
                     parsed_events.append(tool_event)
                     return parsed_events
 
+                reasoning_text = self._parse_reasoning_done(item)
+                if reasoning_text is not None:
+                    parsed_events.append(ThinkingDoneEvent(reasoning_text))
+                    return parsed_events
+
                 content_array = item.get("content")
                 if isinstance(content_array, list):
                     text_parts: list[str] = []
@@ -84,6 +215,25 @@ class BackendEventParser:
                         parsed_events.append(TextDoneEvent("".join(text_parts)))
 
         return parsed_events
+
+    @staticmethod
+    def _parse_reasoning_done(item: dict[str, Any]) -> str | None:
+        if item.get("type") != "reasoning":
+            return None
+
+        summary = item.get("summary")
+        if not isinstance(summary, list):
+            return None
+
+        text_parts: list[str] = []
+        for summary_item in summary:
+            if isinstance(summary_item, dict):
+                text = summary_item.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+
+        combined = "".join(text_parts)
+        return combined or None
 
     def _parse_function_call_added(self, item: dict[str, Any]) -> ToolCallChunkEvent | None:
         if item.get("type") != "function_call":
@@ -180,10 +330,29 @@ class BackendEventParser:
         )
 
 
+def parse_optional_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 def iter_events_from_sse_lines(lines: Iterable[str]) -> list[StreamEvent]:
     parser = BackendEventParser()
     events: list[StreamEvent] = []
+    pending_event_name: str | None = None
     for line in lines:
+        if line.startswith("event: "):
+            pending_event_name = line[7:].strip() or None
+            continue
         if not line.startswith("data: "):
             continue
         json_data = line[6:]
@@ -192,15 +361,21 @@ def iter_events_from_sse_lines(lines: Iterable[str]) -> list[StreamEvent]:
         try:
             payload = json.loads(json_data)
         except json.JSONDecodeError:
+            pending_event_name = None
             continue
         if isinstance(payload, dict):
-            events.extend(parser.parse_event(payload))
+            events.extend(parser.parse_event(payload, sse_event_name=pending_event_name))
+        pending_event_name = None
     return events
 
 
 async def stream_events_from_sse_lines(lines: AsyncIterator[str]) -> AsyncIterator[StreamEvent]:
     parser = BackendEventParser()
+    pending_event_name: str | None = None
     async for line in lines:
+        if line.startswith("event: "):
+            pending_event_name = line[7:].strip() or None
+            continue
         if not line.startswith("data: "):
             continue
         json_data = line[6:]
@@ -209,23 +384,40 @@ async def stream_events_from_sse_lines(lines: AsyncIterator[str]) -> AsyncIterat
         try:
             payload = json.loads(json_data)
         except json.JSONDecodeError:
+            pending_event_name = None
             continue
         if not isinstance(payload, dict):
+            pending_event_name = None
             continue
-        for event in parser.parse_event(payload):
+        for event in parser.parse_event(payload, sse_event_name=pending_event_name):
             yield event
+        pending_event_name = None
 
 
 def parse_backend_sse_text(
     response_text: str,
-) -> tuple[str, list[Any], Usage | None]:
+    *,
+    allow_thinking_only: bool = False,
+) -> tuple[str, str, list[Any], Usage | None]:
     state = StreamState()
     for event in iter_events_from_sse_lines(response_text.splitlines()):
+        if isinstance(event, ErrorEvent):
+            raise BackendSSEError(
+                event.message,
+                status_code=event.status_code,
+                error_type=event.error_type,
+                param=event.param,
+                code=event.code,
+            )
         state.apply(event)
 
-    if not state.has_any_output:
+    has_visible_output = (
+        state.has_any_output if allow_thinking_only else state.has_visible_openai_output
+    )
+
+    if not has_visible_output:
         raise EmptyBackendResponseError(
             "Empty content and no tool calls returned from ChatGPT backend"
         )
 
-    return state.text, list(state.tool_calls), state.usage
+    return state.text, state.thinking, list(state.tool_calls), state.usage

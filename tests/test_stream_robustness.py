@@ -85,6 +85,9 @@ class FakeBackendClient:
     async def fetch_codex_model_slugs(self, client_version: str):  # noqa: ARG002
         return ["gpt-5.4", "gpt-5.3-codex"]
 
+    async def fetch_codex_models(self, client_version: str):  # noqa: ARG002
+        return [{"slug": "gpt-5.4"}, {"slug": "gpt-5.3-codex"}]
+
 
 class SlowFakeBackendClient(FakeBackendClient):
     def __init__(self, lines: list[str], delay_seconds: float) -> None:

@@ -25,6 +25,9 @@ class ChatMessageToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: Any = None
+    thinking: str | None = None
+    reasoning: str | None = None
+    tool_name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[ChatMessageToolCall] | None = None
 
@@ -63,6 +66,7 @@ class ChatToolCall(BaseModel):
 class ChatResponseMessage(BaseModel):
     role: str
     content: str
+    reasoning: str | None = None
     tool_calls: list[ChatToolCall] | None = None
 
 

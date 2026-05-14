@@ -104,12 +104,17 @@ def merge_reasoning(reasoning: Any, selected_effort: str | None) -> Any:
         merged.pop("effort", None)
         if selected_effort is not None:
             merged["effort"] = selected_effort
+        if selected_effort not in {None, "none"}:
+            merged.setdefault("summary", "auto")
         return merged or None
 
     if selected_effort is None:
         return None
 
-    return {"effort": selected_effort}
+    merged = {"effort": selected_effort}
+    if selected_effort != "none":
+        merged["summary"] = "auto"
+    return merged
 
 
 def resolve_model_and_reasoning(

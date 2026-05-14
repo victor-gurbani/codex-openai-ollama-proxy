@@ -12,9 +12,12 @@ import httpx
 
 from codex_openai_ollama_proxy.core.config import DEFAULT_SYSTEM_INSTRUCTIONS, Settings
 from codex_openai_ollama_proxy.core.debug_trace import log_debug_event
-from codex_openai_ollama_proxy.core.errors import EmptyBackendResponseError
+from codex_openai_ollama_proxy.core.errors import BackendSSEError, EmptyBackendResponseError
 from codex_openai_ollama_proxy.schemas.backend import ResponsesApiRequest
 from codex_openai_ollama_proxy.schemas.events import (
+    ErrorEvent,
+    ThinkingDeltaEvent,
+    ThinkingDoneEvent,
     TextDeltaEvent,
     TextDoneEvent,
     ToolCallChunkEvent,
@@ -59,7 +62,10 @@ class ProxyService:
         self._model_catalog = model_catalog
 
     async def proxy_chat_completions(
-        self, chat_req: ChatCompletionsRequest
+        self,
+        chat_req: ChatCompletionsRequest,
+        *,
+        allow_thinking_only: bool = False,
     ) -> ChatCompletionsResponse:
         requested_model = chat_req.model
         responses_req = await self.convert_chat_to_responses(chat_req)
@@ -67,7 +73,10 @@ class ProxyService:
             raise ValueError("No non-system input message found (input is empty)")
 
         response_text = await self._backend_client.send_responses_request(responses_req)
-        response_content, response_tool_calls, usage = parse_backend_sse_text(response_text)
+        response_content, response_thinking, response_tool_calls, usage = parse_backend_sse_text(
+            response_text,
+            allow_thinking_only=allow_thinking_only,
+        )
 
         finish_reason = "stop" if not response_tool_calls else "tool_calls"
         return ChatCompletionsResponse(
@@ -81,6 +90,7 @@ class ProxyService:
                     message=ChatResponseMessage(
                         role="assistant",
                         content=response_content,
+                        reasoning=response_thinking or None,
                         tool_calls=response_tool_calls or None,
                     ),
                     finish_reason=finish_reason,
@@ -108,7 +118,6 @@ class ProxyService:
             disconnected = False
             if is_disconnected is not None and await is_disconnected():
                 return
-            yield formatter.role_chunk()
             lines = await self._backend_client.stream_responses_request(responses_req)
             async for event in stream_events_with_idle_heartbeat(
                 stream_events_from_sse_lines(lines),
@@ -125,11 +134,23 @@ class ProxyService:
                     disconnected = True
                     await maybe_aclose_async_iterator(lines)
                     break
+                if isinstance(event, ErrorEvent):
+                    raise BackendSSEError(
+                        event.message,
+                        status_code=event.status_code,
+                        error_type=event.error_type,
+                        param=event.param,
+                        code=event.code,
+                    )
                 emit = state.apply(event)
                 if isinstance(event, TextDeltaEvent) and emit:
                     yield formatter.content_chunk(event.text)
                 elif isinstance(event, TextDoneEvent) and emit:
                     yield formatter.content_chunk(event.text)
+                elif isinstance(event, ThinkingDeltaEvent) and emit:
+                    yield formatter.reasoning_chunk(event.text)
+                elif isinstance(event, ThinkingDoneEvent) and emit:
+                    yield formatter.reasoning_chunk(event.text)
                 elif isinstance(event, ToolCallChunkEvent) and emit:
                     yield formatter.tool_call_chunk(event)
 
@@ -210,7 +231,7 @@ class ProxyService:
             tools=getattr(request, "tools", None),
             tool_choice=getattr(request, "tool_choice", None),
         )
-        return await self.proxy_chat_completions(chat_request)
+        return await self.proxy_chat_completions(chat_request, allow_thinking_only=True)
 
     async def stream_ollama_chat(
         self,
@@ -263,6 +284,7 @@ class ProxyService:
 
         async def iterator() -> AsyncIterator[str]:
             disconnected = False
+            last_tool_call_signature: str | None = None
             if is_disconnected is not None and await is_disconnected():
                 return
             lines = await self._backend_client.stream_responses_request(responses_req)
@@ -281,13 +303,32 @@ class ProxyService:
                     disconnected = True
                     await maybe_aclose_async_iterator(lines)
                     break
+                if isinstance(event, ErrorEvent):
+                    raise BackendSSEError(
+                        event.message,
+                        status_code=event.status_code,
+                        error_type=event.error_type,
+                        param=event.param,
+                        code=event.code,
+                    )
                 emit = state.apply(event)
                 if isinstance(event, TextDeltaEvent) and emit:
                     yield formatter.content_chunk(event.text)
                 elif isinstance(event, TextDoneEvent) and emit:
                     yield formatter.content_chunk(event.text)
-                elif isinstance(event, ToolCallChunkEvent) and emit and mode == "chat":
-                    yield formatter.tool_call_snapshot_chunk(state.tool_calls)
+                elif isinstance(event, ThinkingDeltaEvent) and emit:
+                    yield formatter.thinking_chunk(event.text)
+                elif isinstance(event, ThinkingDoneEvent) and emit:
+                    yield formatter.thinking_chunk(event.text)
+                elif isinstance(event, ToolCallChunkEvent) and mode == "chat" and state.tool_calls:
+                    tool_call_signature = json.dumps(
+                        [tool.model_dump(by_alias=True) for tool in state.tool_calls],
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    if tool_call_signature != last_tool_call_signature:
+                        yield formatter.tool_call_snapshot_chunk(state.tool_calls)
+                        last_tool_call_signature = tool_call_signature
 
             if disconnected:
                 return
@@ -296,9 +337,6 @@ class ProxyService:
                 raise EmptyBackendResponseError(
                     "Empty content and no tool calls returned from ChatGPT backend"
                 )
-
-            if mode == "chat" and state.tool_calls:
-                yield formatter.tool_calls_chunk(state.tool_calls)
 
             yield formatter.final_chunk(state.usage)
 
@@ -317,7 +355,7 @@ class ProxyService:
             tools=None,
             tool_choice=None,
         )
-        return await self.proxy_chat_completions(chat_request)
+        return await self.proxy_chat_completions(chat_request, allow_thinking_only=True)
 
     def _build_chat_request_from_ollama(
         self,
@@ -333,6 +371,12 @@ class ProxyService:
     ) -> ChatCompletionsRequest:
         normalized_model = normalize_ollama_model(model)
         resolved_messages = list(messages or [])
+        reasoning_effort = normalize_ollama_think(think)
+        reasoning = (
+            {"summary": "auto"}
+            if reasoning_effort not in {None, "none"}
+            else None
+        )
 
         if system and system.strip():
             resolved_messages.insert(
@@ -352,8 +396,8 @@ class ProxyService:
             stream=stream,
             tools=tools,
             tool_choice=tool_choice,
-            reasoning=None,
-            reasoning_effort=normalize_ollama_think(think),
+            reasoning=reasoning,
+            reasoning_effort=reasoning_effort,
         )
 
 
@@ -369,6 +413,10 @@ async def maybe_aclose_async_iterator(iterator: object) -> None:
     aclose = getattr(iterator, "aclose", None)
     if callable(aclose):
         await aclose()
+
+
+async def async_anext(iterator: AsyncIterator[Any]) -> Any:
+    return await iterator.__anext__()
 
 
 def apply_default_reasoning_effort_to_responses_body(
@@ -442,7 +490,7 @@ async def stream_events_with_idle_heartbeat(
             yield event
         return
 
-    pending: asyncio.Task[Any] | None = asyncio.create_task(anext(events))
+    pending: asyncio.Task[Any] | None = asyncio.create_task(async_anext(events))
     try:
         while pending is not None:
             done, _ = await asyncio.wait({pending}, timeout=interval_seconds)
@@ -456,7 +504,7 @@ async def stream_events_with_idle_heartbeat(
                 break
 
             yield event
-            pending = asyncio.create_task(anext(events))
+            pending = asyncio.create_task(async_anext(events))
     finally:
         if pending is not None and not pending.done():
             pending.cancel()

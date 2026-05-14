@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -10,7 +12,7 @@ from codex_openai_ollama_proxy.core.debug_trace import (
     log_debug_event,
     start_debug_request,
 )
-from codex_openai_ollama_proxy.core.errors import ollama_error_response
+from codex_openai_ollama_proxy.core.errors import BackendSSEError, ollama_error_response
 from codex_openai_ollama_proxy.schemas.ollama import (
     OllamaChatRequest,
     OllamaGenerateRequest,
@@ -22,6 +24,13 @@ from codex_openai_ollama_proxy.services.streaming_formatter import build_ollama_
 from codex_openai_ollama_proxy.services.tool_conversion import convert_chat_tool_calls_to_ollama
 
 router = APIRouter(tags=["ollama"])
+
+SHOW_CAPABILITIES = ["completion", "tools", "thinking"]
+
+
+def normalize_family_name(value: str) -> str:
+    normalized = "".join(ch for ch in value.strip().lower() if ch.isalnum())
+    return normalized
 
 
 def parse_positive_int(value: object) -> int | None:
@@ -43,15 +52,89 @@ def parse_positive_int(value: object) -> int | None:
 def metadata_context_length(metadata: dict[str, object] | None) -> int | None:
     if metadata is None:
         return None
+    values: list[int] = []
     for key in ("context_window", "context_length", "max_context_window"):
         parsed = parse_positive_int(metadata.get(key))
         if parsed is not None:
-            return parsed
-    return None
+            values.append(parsed)
+    return max(values) if values else None
 
 
-def ollama_model_details(model: str) -> dict[str, object]:
-    family = "codex" if "codex" in model else "gpt"
+def infer_ollama_family(model: str, metadata: dict[str, object] | None) -> str:
+    if metadata is not None:
+        family = metadata.get("family")
+        if isinstance(family, str) and family.strip():
+            normalized = normalize_family_name(family)
+            if normalized:
+                return normalized
+
+        families = metadata.get("families")
+        if isinstance(families, list | tuple | set):
+            for family_value in families:
+                if isinstance(family_value, str) and family_value.strip():
+                    normalized = normalize_family_name(family_value)
+                    if normalized:
+                        return normalized
+
+    normalized_model = model.split(":", 1)[0].strip().lower()
+    if "codex" in normalized_model:
+        return "codex"
+
+    family_token = normalized_model.split("-", 1)[0]
+    normalized = normalize_family_name(family_token)
+    return normalized or "model"
+
+
+def metadata_supports_image_input(metadata: dict[str, object] | None) -> bool:
+    if metadata is None:
+        return False
+
+    input_modalities = metadata.get("input_modalities")
+    if isinstance(input_modalities, list | tuple | set):
+        return any(
+            isinstance(item, str) and item.strip().lower() == "image"
+            for item in input_modalities
+        )
+
+    for key in ("supports_image", "image_input", "vision"):
+        if metadata.get(key) is True:
+            return True
+
+    return False
+
+
+def add_namespaced_metadata(
+    model_info: dict[str, object], metadata: dict[str, object] | None
+) -> None:
+    if metadata is None:
+        return
+
+    metadata_mappings = (
+        ("display_name", "codex.display_name"),
+        ("description", "codex.description"),
+        ("supported_reasoning_levels", "codex.reasoning.supported_levels"),
+        ("default_reasoning_level", "codex.reasoning.default_level"),
+        ("default_reasoning_summary", "codex.reasoning.default_summary"),
+        ("default_verbosity", "codex.verbosity.default"),
+        ("support_verbosity", "codex.verbosity.supported"),
+        ("service_tiers", "codex.service_tiers"),
+        ("truncation_policy", "codex.truncation_policy"),
+    )
+    for metadata_key, model_info_key in metadata_mappings:
+        value = metadata.get(metadata_key)
+        if value is not None:
+            model_info[model_info_key] = value
+
+    additional_speed_tiers = metadata.get("additional_speed_tiers")
+    if isinstance(additional_speed_tiers, list):
+        model_info["codex.additional_speed_tiers"] = additional_speed_tiers
+        model_info["codex.fast_tier_available"] = "fast" in additional_speed_tiers
+
+
+def ollama_model_details(
+    model: str, metadata: dict[str, object] | None = None
+) -> dict[str, object]:
+    family = infer_ollama_family(model, metadata)
     return {
         "parent_model": "",
         "format": "proxy",
@@ -65,7 +148,7 @@ def ollama_model_details(model: str) -> dict[str, object]:
 def ollama_show_payload(
     model: str, metadata: dict[str, object] | None = None
 ) -> dict[str, object]:
-    details = ollama_model_details(model)
+    details = ollama_model_details(model, metadata)
     model_info: dict[str, object] = {
         "general.architecture": details["family"],
         "general.basename": model,
@@ -75,17 +158,25 @@ def ollama_show_payload(
         "codex.proxy.format": details["format"],
         "codex.proxy.variant": "synthetic-metadata",
     }
+    parameters = ""
     context_length = metadata_context_length(metadata)
     if context_length is not None:
         model_info["general.context_length"] = context_length
+        model_info[f"{details['family']}.context_length"] = context_length
+        parameters = f"num_ctx {context_length}"
+    add_namespaced_metadata(model_info, metadata)
+
+    capabilities = list(SHOW_CAPABILITIES)
+    if metadata_supports_image_input(metadata):
+        capabilities.append("vision")
     return {
         "license": "",
         "modelfile": f"FROM {model}\n",
-        "parameters": "",
+        "parameters": parameters,
         "template": "",
         "details": details,
         "model_info": model_info,
-        "capabilities": ["completion", "tools", "thinking"],
+        "capabilities": capabilities,
         "modified_at": "1970-01-01T00:00:00.000Z",
         "requires": "0.17.1",
         "tensors": [],
@@ -98,6 +189,42 @@ def ollama_not_found_response(model: str) -> JSONResponse:
         headers={"Access-Control-Allow-Origin": "*"},
         content={"error": f"model '{model}' not found"},
     )
+
+
+def format_proxy_expires_at(ttl_seconds: float) -> str:
+    expires_at = datetime.now(UTC) + timedelta(seconds=max(ttl_seconds, 0.0))
+    return expires_at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def metadata_size_vram(metadata: dict[str, object] | None) -> int:
+    if metadata is None:
+        return 0
+    for key in ("size_vram", "size_vram_bytes"):
+        parsed = parse_positive_int(metadata.get(key))
+        if parsed is not None:
+            return parsed
+    return 0
+
+
+def ollama_ps_model_payload(
+    model: str,
+    metadata: dict[str, object] | None,
+    *,
+    expires_at: str,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "name": model,
+        "model": model,
+        "size": 0,
+        "digest": "",
+        "details": ollama_model_details(model),
+        "expires_at": expires_at,
+        "size_vram": metadata_size_vram(metadata),
+    }
+    context_length = metadata_context_length(metadata)
+    if context_length is not None:
+        payload["context_length"] = context_length
+    return payload
 
 
 @router.get("/api/tags")
@@ -119,6 +246,22 @@ async def ollama_tags(
             for model in models
         ]
     }
+
+
+@router.get("/api/ps")
+async def ollama_ps(
+    settings: Settings = Depends(get_settings),
+    model_catalog: ModelCatalogService = Depends(get_model_catalog),
+) -> dict[str, object]:
+    expires_at = format_proxy_expires_at(settings.model_catalog_ttl_seconds)
+    models = await model_catalog.get_exposed_models()
+    payload_models: list[dict[str, object]] = []
+    for model in models:
+        metadata = await model_catalog.get_model_metadata_for_request(model)
+        payload_models.append(
+            ollama_ps_model_payload(model, metadata, expires_at=expires_at)
+        )
+    return {"models": payload_models}
 
 
 @router.post("/api/show")
@@ -157,7 +300,8 @@ async def ollama_chat(
                         emitted_chunks.append(chunk)
                         yield chunk
                 except Exception as exc:  # noqa: BLE001
-                    chunk = build_ollama_error_ndjson(f"proxy error: {exc}")
+                    message = exc.message if isinstance(exc, BackendSSEError) else f"proxy error: {exc}"
+                    chunk = build_ollama_error_ndjson(message)
                     emitted_chunks.append(chunk)
                     yield chunk
             finally:
@@ -188,10 +332,14 @@ async def ollama_chat(
         return error_response
 
     content = response.choices[0].message.content
+    thinking = response.choices[0].message.reasoning
+    message: dict[str, object] = {"role": "assistant", "content": content}
+    if thinking:
+        message["thinking"] = thinking
     payload = {
         "model": response.model,
         "created_at": "1970-01-01T00:00:00.000Z",
-        "message": {"role": "assistant", "content": content},
+        "message": message,
         "done": True,
         "done_reason": "stop",
         "total_duration": 0,
@@ -238,7 +386,8 @@ async def ollama_generate(
                         emitted_chunks.append(chunk)
                         yield chunk
                 except Exception as exc:  # noqa: BLE001
-                    chunk = build_ollama_error_ndjson(f"proxy error: {exc}")
+                    message = exc.message if isinstance(exc, BackendSSEError) else f"proxy error: {exc}"
+                    chunk = build_ollama_error_ndjson(message)
                     emitted_chunks.append(chunk)
                     yield chunk
             finally:
@@ -269,6 +418,7 @@ async def ollama_generate(
         return error_response
 
     content = response.choices[0].message.content
+    thinking = response.choices[0].message.reasoning
     payload = {
         "model": response.model,
         "created_at": "1970-01-01T00:00:00.000Z",
@@ -283,6 +433,8 @@ async def ollama_generate(
         "eval_count": response.usage.completion_tokens if response.usage else 0,
         "eval_duration": 0,
     }
+    if thinking:
+        payload["thinking"] = thinking
     log_debug_event(
         "client_response",
         status_code=200,

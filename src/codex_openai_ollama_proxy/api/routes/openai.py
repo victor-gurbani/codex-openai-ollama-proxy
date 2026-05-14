@@ -9,7 +9,7 @@ from codex_openai_ollama_proxy.core.debug_trace import (
     log_debug_event,
     start_debug_request,
 )
-from codex_openai_ollama_proxy.core.errors import openai_error_response
+from codex_openai_ollama_proxy.core.errors import BackendSSEError, openai_error_response
 from codex_openai_ollama_proxy.schemas.openai import ChatCompletionsRequest
 from codex_openai_ollama_proxy.services.proxy_service import ProxyService
 from codex_openai_ollama_proxy.services.streaming_formatter import build_openai_error_sse
@@ -76,7 +76,8 @@ async def chat_completions(
                         emitted_chunks.append(chunk)
                         yield chunk
                 except Exception as exc:  # noqa: BLE001
-                    chunk = build_openai_error_sse(request.model, f"Proxy error: {exc}")
+                    message = exc.message if isinstance(exc, BackendSSEError) else f"Proxy error: {exc}"
+                    chunk = build_openai_error_sse(request.model, message)
                     emitted_chunks.append(chunk)
                     yield chunk
             finally:
@@ -98,7 +99,10 @@ async def chat_completions(
         )
 
     try:
-        response = await proxy_service.proxy_chat_completions(request)
+        response = await proxy_service.proxy_chat_completions(
+            request,
+            allow_thinking_only=True,
+        )
     except Exception as exc:  # noqa: BLE001
         error_response = openai_error_response(exc)
         log_debug_event(

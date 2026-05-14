@@ -87,7 +87,29 @@ class OpenAIStreamFormatter:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
-            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": text},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+    def reasoning_chunk(self, text: str) -> str:
+        payload = {
+            "id": self.chunk_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "", "reasoning": text},
+                    "finish_reason": None,
+                }
+            ],
         }
         return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
@@ -113,7 +135,11 @@ class OpenAIStreamFormatter:
             "choices": [
                 {
                     "index": 0,
-                    "delta": {"tool_calls": [tool_call_payload]},
+                    "delta": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [tool_call_payload],
+                    },
                     "finish_reason": None,
                 }
             ],
@@ -126,7 +152,13 @@ class OpenAIStreamFormatter:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "finish_reason": finish_reason,
+                }
+            ],
         }
         if usage is not None:
             payload["usage"] = usage.model_dump()
@@ -160,6 +192,25 @@ class OllamaStreamFormatter:
                 "model": self.model,
                 "created_at": created_at,
                 "response": text,
+                "done": False,
+            }
+        return json.dumps(payload, separators=(",", ":")) + "\n"
+
+    def thinking_chunk(self, text: str) -> str:
+        created_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        if self.mode == "chat":
+            payload = {
+                "model": self.model,
+                "created_at": created_at,
+                "message": {"role": "assistant", "content": "", "thinking": text},
+                "done": False,
+            }
+        else:
+            payload = {
+                "model": self.model,
+                "created_at": created_at,
+                "response": "",
+                "thinking": text,
                 "done": False,
             }
         return json.dumps(payload, separators=(",", ":")) + "\n"
@@ -256,20 +307,20 @@ def build_openai_error_sse(model: str, message: str) -> str:
 
 def build_ollama_chat_ndjson(response: ChatCompletionsResponse) -> str:
     content = response.choices[0].message.content
+    thinking = response.choices[0].message.reasoning
     tool_calls = response.choices[0].message.tool_calls
     created_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    message: dict[str, object] = {"role": "assistant", "content": content}
+    if thinking:
+        message["thinking"] = thinking
+    if tool_calls:
+        message["tool_calls"] = convert_chat_tool_calls_to_ollama(tool_calls)
     content_chunk: dict[str, object] = {
         "model": response.model,
         "created_at": created_at,
-        "message": {"role": "assistant", "content": content},
+        "message": message,
         "done": False,
     }
-    if tool_calls:
-        content_chunk["message"] = {
-            "role": "assistant",
-            "content": content,
-            "tool_calls": convert_chat_tool_calls_to_ollama(tool_calls),
-        }
     done_chunk = {
         "model": response.model,
         "created_at": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -294,6 +345,7 @@ def build_ollama_chat_ndjson(response: ChatCompletionsResponse) -> str:
 
 def build_ollama_generate_ndjson(response: ChatCompletionsResponse) -> str:
     content = response.choices[0].message.content
+    thinking = response.choices[0].message.reasoning
     created_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     content_chunk = {
         "model": response.model,
@@ -301,6 +353,8 @@ def build_ollama_generate_ndjson(response: ChatCompletionsResponse) -> str:
         "response": content,
         "done": False,
     }
+    if thinking:
+        content_chunk["thinking"] = thinking
     done_chunk = {
         "model": response.model,
         "created_at": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),

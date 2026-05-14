@@ -100,10 +100,7 @@ def test_openai_responses_passthrough_route_preserves_json_body_and_headers(
     settings = build_settings(auth_path)
     app = create_app(settings)
 
-    request_body = (
-        '{\n  "model": "gpt-5.4",\n  "input": "hello",\n'
-        '  "reasoning": {"effort": "high"}\n}'
-    )
+    request_body = '{"model":"gpt-5.4","input":"hello","reasoning":{"effort":"high"}}'
     response_body = '{"id":"resp_123","object":"response","status":"completed"}'
 
     with respx.mock(assert_all_called=True) as respx_mock:
@@ -134,7 +131,12 @@ def test_openai_responses_passthrough_route_preserves_json_body_and_headers(
     assert response.text == response_body
     assert response.headers["content-type"].startswith("application/json")
     assert response.headers["x-request-id"] == "req_123"
-    assert route.calls.last.request.content == request_body.encode("utf-8")
+    assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
+        "model": "gpt-5.4",
+        "input": "hello",
+        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
+        "reasoning": {"effort": "high"},
+    }
     assert route.calls.last.request.headers["authorization"] == "Bearer backend_key"
     assert route.calls.last.request.headers["accept"] == "application/json"
     assert route.calls.last.request.headers["openai-beta"] == "responses=v1"
@@ -169,6 +171,7 @@ def test_openai_responses_passthrough_defaults_missing_reasoning_to_xhigh(
     assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
         "model": "gpt-5.4",
         "input": "hello",
+        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
         "reasoning": {"effort": "xhigh"},
     }
 
@@ -200,6 +203,7 @@ def test_openai_responses_passthrough_defaults_empty_reasoning_effort_to_xhigh(
     assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
         "model": "gpt-5.4",
         "input": "hello",
+        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
         "reasoning": {"summary": "auto", "effort": "xhigh"},
     }
 
@@ -236,10 +240,159 @@ def test_openai_responses_passthrough_route_preserves_sse_stream(tmp_path: Path)
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.text == backend_body
-    assert (
-        route.calls.last.request.content
-        == b'{"model":"gpt-5.4","input":"hello","stream":true,"reasoning":{"effort":"high"}}'
+    assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
+        "model": "gpt-5.4",
+        "input": "hello",
+        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
+        "stream": True,
+        "reasoning": {"effort": "high"},
+    }
+
+
+def test_openai_responses_passthrough_strips_backend_unsupported_generation_fields(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    request_body = json.dumps(
+        {
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "temperature": 0.1,
+            "top_p": 0.5,
+            "seed": 7,
+            "max_output_tokens": 5,
+            "presence_penalty": 0.2,
+            "frequency_penalty": 0.2,
+            "stop": ["DONE"],
+            "n": 2,
+        }
     )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text='{"id":"resp_123"}', headers={"content-type": "application/json"})
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content=request_body,
+                headers={"Content-Type": "application/json"},
+            )
+
+    assert response.status_code == 200
+    assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
+        "model": "gpt-5.4",
+        "input": [{"role": "user", "content": "hello"}],
+        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
+        "stream": True,
+        "reasoning": {"effort": "xhigh"},
+    }
+
+
+def test_openai_responses_passthrough_flattens_nested_function_tools(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    request_body = json.dumps(
+        {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_files",
+                        "description": "List files",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text='{"id":"resp_123"}', headers={"content-type": "application/json"})
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content=request_body,
+                headers={"Content-Type": "application/json"},
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["tools"] == [
+        {
+            "type": "function",
+            "name": "list_files",
+            "description": "List files",
+            "parameters": {"type": "object"},
+        }
+    ]
+
+
+def test_openai_responses_passthrough_adds_default_name_to_json_schema_text_format(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    request_body = json.dumps(
+        {
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                    },
+                }
+            },
+        }
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text='{"id":"resp_123"}', headers={"content-type": "application/json"})
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content=request_body,
+                headers={"Content-Type": "application/json"},
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "response",
+            "schema": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+            },
+            "strict": True,
+        }
+    }
 
 
 def test_openai_responses_passthrough_route_preserves_backend_error(tmp_path: Path) -> None:

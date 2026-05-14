@@ -225,9 +225,10 @@ class ProxyService:
         request_body: bytes,
         incoming_headers: Mapping[str, str] | None = None,
     ) -> httpx.Response:
-        request_body = apply_default_reasoning_effort_to_responses_body(
+        request_body = normalize_responses_body_for_backend(
             request_body,
             default_effort="xhigh",
+            default_instructions=DEFAULT_SYSTEM_INSTRUCTIONS,
         )
         return await self._backend_client.open_responses_passthrough(
             request_body,
@@ -532,6 +533,80 @@ def apply_default_reasoning_effort_to_responses_body(
     updated_payload = with_default_reasoning_effort(payload, default_effort=default_effort)
     if updated_payload is payload:
         return request_body
+
+    return json.dumps(
+        updated_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+RESPONSES_UNSUPPORTED_FIELDS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "seed",
+        "max_output_tokens",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop",
+        "n",
+        "previous_response_id",
+        "conversation",
+        "truncation",
+    }
+)
+
+
+def normalize_responses_body_for_backend(
+    request_body: bytes,
+    *,
+    default_effort: str,
+    default_instructions: str,
+) -> bytes:
+    try:
+        payload = json.loads(request_body)
+    except (TypeError, ValueError):
+        return request_body
+
+    if not isinstance(payload, dict):
+        return request_body
+
+    updated_payload = dict(payload)
+
+    if not isinstance(updated_payload.get("instructions"), str) or not updated_payload.get(
+        "instructions", ""
+    ).strip():
+        updated_payload["instructions"] = default_instructions
+
+    if "reasoning_effort" in updated_payload and "reasoning" not in updated_payload:
+        updated_payload["reasoning"] = {"effort": updated_payload.pop("reasoning_effort")}
+
+    normalized_payload = with_default_reasoning_effort(
+        updated_payload,
+        default_effort=default_effort,
+    )
+    if isinstance(normalized_payload, dict):
+        updated_payload = dict(normalized_payload)
+
+    tools = updated_payload.get("tools")
+    if isinstance(tools, list):
+        updated_payload["tools"] = convert_chat_tools_to_responses(tools)
+
+    text_config = updated_payload.get("text")
+    if isinstance(text_config, dict):
+        format_config = text_config.get("format")
+        if isinstance(format_config, dict) and format_config.get("type") == "json_schema":
+            format_config = dict(format_config)
+            format_config.setdefault("name", "response")
+            if "strict" not in format_config:
+                format_config["strict"] = True
+            updated_text = dict(text_config)
+            updated_text["format"] = format_config
+            updated_payload["text"] = updated_text
+
+    for field_name in RESPONSES_UNSUPPORTED_FIELDS:
+        updated_payload.pop(field_name, None)
 
     return json.dumps(
         updated_payload,

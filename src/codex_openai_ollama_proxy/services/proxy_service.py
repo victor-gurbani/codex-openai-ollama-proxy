@@ -388,11 +388,9 @@ class ProxyService:
         normalized_model = normalize_ollama_model(model)
         resolved_messages = list(messages or [])
         reasoning_effort = normalize_ollama_think(think)
-        reasoning = (
-            {"summary": "auto"}
-            if reasoning_effort not in {None, "none"}
-            else None
-        )
+        reasoning = None
+        if think is None or reasoning_effort not in {None, "none"}:
+            reasoning = {"summary": "auto"}
 
         def merge_images_into_content(content: Any, message_images: list[str] | None) -> Any:
             if not message_images:

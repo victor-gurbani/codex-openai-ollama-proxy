@@ -578,6 +578,56 @@ def test_ollama_chat_think_true_maps_to_medium_reasoning(tmp_path: Path) -> None
     assert backend_payload["reasoning"] == {"summary": "auto", "effort": "medium"}
 
 
+def test_ollama_chat_without_think_requests_reasoning_by_default(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_sse_body())
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-5.4",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                },
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["reasoning"] == {"summary": "auto"}
+
+
+def test_ollama_generate_without_think_requests_reasoning_by_default(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_sse_body())
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/generate",
+                json={
+                    "model": "gpt-5.4",
+                    "prompt": "hello",
+                    "stream": False,
+                },
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["reasoning"] == {"summary": "auto"}
+
+
 def test_ollama_chat_non_streaming_returns_thinking(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})

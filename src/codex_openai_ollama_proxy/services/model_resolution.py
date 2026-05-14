@@ -153,9 +153,7 @@ def resolve_temperature(
     reasoning: Any,
     temperature: float | None,
 ) -> float | None:
-    if not effective_reasoning_is_none(request_model, backend_model, reasoning):
-        return None
-    return temperature
+    return None
 
 
 def exposed_model_list(base_models: Sequence[str] | None = None) -> list[str]:

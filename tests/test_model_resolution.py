@@ -37,7 +37,7 @@ def test_gpt53_codex_rejects_none_reasoning() -> None:
 
 
 def test_temperature_only_passes_for_gpt54_none() -> None:
-    assert resolve_temperature(MODEL_GENERAL, MODEL_GENERAL, None, 0.2) == 0.2
+    assert resolve_temperature(MODEL_GENERAL, MODEL_GENERAL, None, 0.2) is None
     assert resolve_temperature("gpt-5.4-high", MODEL_GENERAL, {"effort": "high"}, 0.2) is None
     assert resolve_temperature(MODEL_CODEX, MODEL_CODEX, None, 0.2) is None
 
@@ -71,7 +71,7 @@ def test_dynamic_model_behaves_like_gpt54_for_none_and_temperature() -> None:
 
     assert backend_model == "gpt-5.4-mini"
     assert reasoning == {"effort": "none"}
-    assert resolve_temperature("gpt-5.4-mini", backend_model, reasoning, 0.2) == 0.2
+    assert resolve_temperature("gpt-5.4-mini", backend_model, reasoning, 0.2) is None
 
 
 def test_is_known_model_recognizes_dynamic_suffix_aliases() -> None:

@@ -6,6 +6,7 @@ from typing import Any
 from codex_openai_ollama_proxy.core.config import DEFAULT_SYSTEM_INSTRUCTIONS
 from codex_openai_ollama_proxy.schemas.openai import ChatMessage
 from codex_openai_ollama_proxy.services.tool_conversion import (
+    PendingToolCall,
     assistant_tool_calls_to_input,
     tool_message_to_output,
 )
@@ -27,6 +28,14 @@ def extract_content_text(content: Any) -> str:
     if content is None:
         return ""
     return str(content)
+
+
+def extract_reasoning_text(message: ChatMessage) -> str:
+    if isinstance(message.reasoning, str) and message.reasoning.strip():
+        return message.reasoning
+    if isinstance(message.thinking, str) and message.thinking.strip():
+        return message.thinking
+    return ""
 
 
 def _text_item(text: str, is_assistant: bool) -> dict[str, Any] | None:
@@ -137,7 +146,7 @@ def convert_messages_to_input(
 ) -> tuple[list[dict[str, Any]], str]:
     input_items: list[dict[str, Any]] = []
     system_instructions: list[str] = []
-    pending_tool_call_ids: deque[str] = deque()
+    pending_tool_calls: deque[PendingToolCall] = deque()
 
     for message in messages:
         role = message.role
@@ -149,7 +158,16 @@ def convert_messages_to_input(
             continue
 
         if role.lower() == "assistant":
-            assistant_content = parse_chat_content_items(message.content, is_assistant=True)
+            assistant_content: list[dict[str, Any]] = []
+            reasoning_text = extract_reasoning_text(message)
+            if reasoning_text.strip():
+                reasoning_item = _text_item(reasoning_text, is_assistant=True)
+                if reasoning_item:
+                    assistant_content.append(reasoning_item)
+
+            assistant_content.extend(
+                parse_chat_content_items(message.content, is_assistant=True)
+            )
             if assistant_content:
                 input_items.append(
                     {
@@ -160,13 +178,13 @@ def convert_messages_to_input(
                     }
                 )
             input_items.extend(
-                assistant_tool_calls_to_input(message.tool_calls, pending_tool_call_ids)
+                assistant_tool_calls_to_input(message.tool_calls, pending_tool_calls)
             )
             continue
 
         if role.lower() == "tool":
             input_items.append(
-                tool_message_to_output(message, pending_tool_call_ids, content_text)
+                tool_message_to_output(message, pending_tool_calls, content_text)
             )
             continue
 

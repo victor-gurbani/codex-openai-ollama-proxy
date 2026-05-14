@@ -54,3 +54,188 @@ def test_convert_messages_to_input_infers_tool_call_id() -> None:
         for item in input_items
     )
     assert instructions
+
+
+def test_convert_messages_to_input_prefers_tool_name_for_matching_outputs() -> None:
+    messages = [
+        ChatMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[
+                ChatMessageToolCall(
+                    id="call_temperature",
+                    type="function",
+                    function=ChatMessageToolFunction(
+                        name="get_temperature", arguments={"city": "New York"}
+                    ),
+                ),
+                ChatMessageToolCall(
+                    id="call_conditions",
+                    type="function",
+                    function=ChatMessageToolFunction(
+                        name="get_conditions", arguments={"city": "New York"}
+                    ),
+                ),
+            ],
+        ),
+        ChatMessage(role="tool", tool_name="get_conditions", content="Partly cloudy"),
+        ChatMessage(role="tool", tool_name="get_temperature", content="22°C"),
+    ]
+
+    input_items, instructions = convert_messages_to_input(messages)
+
+    tool_outputs = [item for item in input_items if item["type"] == "function_call_output"]
+    assert tool_outputs == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_conditions",
+            "name": "get_conditions",
+            "output": "Partly cloudy",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_temperature",
+            "name": "get_temperature",
+            "output": "22°C",
+        },
+    ]
+    assert instructions
+
+
+def test_convert_messages_to_input_tool_call_id_overrides_tool_name() -> None:
+    messages = [
+        ChatMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[
+                ChatMessageToolCall(
+                    id="call_a",
+                    type="function",
+                    function=ChatMessageToolFunction(name="lookup", arguments={"id": 1}),
+                ),
+                ChatMessageToolCall(
+                    id="call_b",
+                    type="function",
+                    function=ChatMessageToolFunction(name="lookup", arguments={"id": 2}),
+                ),
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            tool_name="lookup",
+            tool_call_id="call_b",
+            content="result for b",
+        ),
+        ChatMessage(role="tool", content="result for a"),
+    ]
+
+    input_items, instructions = convert_messages_to_input(messages)
+
+    tool_outputs = [item for item in input_items if item["type"] == "function_call_output"]
+    assert tool_outputs == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_b",
+            "name": "lookup",
+            "output": "result for b",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_a",
+            "name": "lookup",
+            "output": "result for a",
+        },
+    ]
+    assert instructions
+
+
+def test_convert_messages_to_input_tool_name_handles_duplicate_calls_fifo() -> None:
+    messages = [
+        ChatMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[
+                ChatMessageToolCall(
+                    id="call_first",
+                    type="function",
+                    function=ChatMessageToolFunction(name="lookup", arguments={"id": 1}),
+                ),
+                ChatMessageToolCall(
+                    id="call_second",
+                    type="function",
+                    function=ChatMessageToolFunction(name="lookup", arguments={"id": 2}),
+                ),
+            ],
+        ),
+        ChatMessage(role="tool", tool_name="lookup", content="first result"),
+        ChatMessage(role="tool", tool_name="lookup", content="second result"),
+    ]
+
+    input_items, instructions = convert_messages_to_input(messages)
+
+    tool_outputs = [item for item in input_items if item["type"] == "function_call_output"]
+    assert tool_outputs == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_first",
+            "name": "lookup",
+            "output": "first result",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_second",
+            "name": "lookup",
+            "output": "second result",
+        },
+    ]
+    assert instructions
+
+
+def test_convert_messages_to_input_replays_assistant_thinking_before_content() -> None:
+    messages = [
+        ChatMessage(
+            role="assistant",
+            thinking="I should inspect files first.",
+            content="Calling the tool now.",
+        )
+    ]
+
+    input_items, instructions = convert_messages_to_input(messages)
+
+    assert input_items == [
+        {
+            "type": "message",
+            "id": None,
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "I should inspect files first."},
+                {"type": "output_text", "text": "Calling the tool now."},
+            ],
+        }
+    ]
+    assert instructions
+
+
+def test_convert_messages_to_input_replays_openai_reasoning_before_content() -> None:
+    messages = [
+        ChatMessage(
+            role="assistant",
+            reasoning="I should calculate before responding.",
+            content="The answer is 5.",
+        )
+    ]
+
+    input_items, instructions = convert_messages_to_input(messages)
+
+    assert input_items == [
+        {
+            "type": "message",
+            "id": None,
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "I should calculate before responding."},
+                {"type": "output_text", "text": "The answer is 5."},
+            ],
+        }
+    ]
+    assert instructions

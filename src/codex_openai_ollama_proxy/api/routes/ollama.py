@@ -282,13 +282,19 @@ async def ollama_chat(
     request: OllamaChatRequest,
     raw_request: Request,
     proxy_service: ProxyService = Depends(get_proxy_service),
+    model_catalog: ModelCatalogService = Depends(get_model_catalog),
 ):
+    normalized_model = normalize_ollama_model(request.model)
+    exposed_models = await model_catalog.get_exposed_models()
+    if normalized_model not in exposed_models:
+        return ollama_not_found_response(normalized_model)
+
     debug_tokens = start_debug_request(
         raw_request.url.path,
         request.model_dump(by_alias=True, exclude_none=True),
     )
 
-    if request.stream:
+    if request.stream is not False:
         async def stream_with_error_fallback():
             emitted_chunks: list[str] = []
             try:
@@ -368,13 +374,19 @@ async def ollama_generate(
     request: OllamaGenerateRequest,
     raw_request: Request,
     proxy_service: ProxyService = Depends(get_proxy_service),
+    model_catalog: ModelCatalogService = Depends(get_model_catalog),
 ):
+    normalized_model = normalize_ollama_model(request.model)
+    exposed_models = await model_catalog.get_exposed_models()
+    if normalized_model not in exposed_models:
+        return ollama_not_found_response(normalized_model)
+
     debug_tokens = start_debug_request(
         raw_request.url.path,
         request.model_dump(by_alias=True, exclude_none=True),
     )
 
-    if request.stream:
+    if request.stream is not False:
         async def stream_with_error_fallback():
             emitted_chunks: list[str] = []
             try:

@@ -7,6 +7,7 @@ import respx
 from fastapi.testclient import TestClient
 from httpx import Response
 
+from codex_openai_ollama_proxy.api.routes.ollama import ollama_model_details
 from codex_openai_ollama_proxy.app import create_app
 from codex_openai_ollama_proxy.core.config import Settings
 
@@ -22,6 +23,7 @@ def build_settings(auth_path: Path) -> Settings:
         required_client_api_key=None,
         service_name="codex-openai-ollama-proxy",
         service_version="0.1.0",
+        ollama_compat_version="0.22.0",
     )
 
 
@@ -41,6 +43,384 @@ def backend_tool_call_body() -> str:
     )
 
 
+def test_api_version_returns_ollama_compat_semver(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/api/version")
+
+    assert response.status_code == 200
+    assert response.json() == {"version": "0.22.0"}
+
+
+def test_api_version_head_succeeds(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.head("/api/version")
+
+    assert response.status_code == 200
+    assert response.text == ""
+
+
+def test_ollama_show_known_model_returns_metadata(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/api/show", json={"model": "gpt-5.4"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert sorted(payload.keys()) == [
+        "capabilities",
+        "details",
+        "license",
+        "model_info",
+        "modelfile",
+        "modified_at",
+        "parameters",
+        "requires",
+        "template",
+        "tensors",
+    ]
+    assert payload["details"]["format"] == "proxy"
+    assert payload["modelfile"] == "FROM gpt-5.4\n"
+    assert payload["model_info"]["general.basename"] == "gpt-5.4"
+    assert payload["model_info"]["general.file_type"] == 0
+    assert "general.context_length" not in payload["model_info"]
+    assert payload["capabilities"] == ["completion", "tools", "thinking"]
+    assert payload["modified_at"] == "1970-01-01T00:00:00.000Z"
+    assert payload["requires"] == "0.17.1"
+    assert payload["tensors"] == []
+
+
+def test_ollama_show_uses_context_window_from_backend_catalog(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    catalog_body = {
+        "models": [
+            {
+                "slug": "gpt-5.4",
+                "display_name": "gpt-5.4",
+                "context_window": 272000,
+                "max_context_window": 1000000,
+            },
+            {"slug": "gpt-5.3-codex", "display_name": "gpt-5.3-codex", "context_window": 272000},
+        ]
+    }
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get(settings.backend_models_url).mock(return_value=Response(200, json=catalog_body))
+        with TestClient(app) as client:
+            response = client.post("/api/show", json={"model": "gpt-5.4"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["model_info"]["general.context_length"] == 1000000
+    assert payload["model_info"]["gpt.context_length"] == 1000000
+    assert payload["parameters"] == "num_ctx 1000000"
+
+
+def test_ollama_show_adds_vision_and_namespaced_codex_metadata(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    catalog_body = {
+        "models": [
+            {
+                "slug": "gpt-5.4",
+                "display_name": "GPT-5.4",
+                "description": "General-purpose Codex-backed model",
+                "context_window": 272000,
+                "max_context_window": 1000000,
+                "input_modalities": ["text", "image"],
+                "supported_reasoning_levels": ["low", "medium", "high", "xhigh"],
+                "default_reasoning_level": "medium",
+                "default_reasoning_summary": "auto",
+                "default_verbosity": "medium",
+                "support_verbosity": True,
+                "additional_speed_tiers": ["fast"],
+                "service_tiers": ["default", "flex"],
+                "truncation_policy": "disabled",
+            }
+        ]
+    }
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get(settings.backend_models_url).mock(return_value=Response(200, json=catalog_body))
+        with TestClient(app) as client:
+            response = client.post("/api/show", json={"model": "gpt-5.4"})
+
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert sorted(payload.keys()) == [
+        "capabilities",
+        "details",
+        "license",
+        "model_info",
+        "modelfile",
+        "modified_at",
+        "parameters",
+        "requires",
+        "template",
+        "tensors",
+    ]
+    assert payload["capabilities"] == ["completion", "tools", "thinking", "vision"]
+    assert payload["model_info"]["general.context_length"] == 1000000
+    assert payload["model_info"]["gpt.context_length"] == 1000000
+    assert payload["model_info"]["codex.display_name"] == "GPT-5.4"
+    assert payload["model_info"]["codex.description"] == "General-purpose Codex-backed model"
+    assert payload["model_info"]["codex.reasoning.supported_levels"] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
+    assert payload["model_info"]["codex.reasoning.default_level"] == "medium"
+    assert payload["model_info"]["codex.reasoning.default_summary"] == "auto"
+    assert payload["model_info"]["codex.verbosity.default"] == "medium"
+    assert payload["model_info"]["codex.verbosity.supported"] is True
+    assert payload["model_info"]["codex.additional_speed_tiers"] == ["fast"]
+    assert payload["model_info"]["codex.fast_tier_available"] is True
+    assert payload["model_info"]["codex.service_tiers"] == ["default", "flex"]
+    assert payload["model_info"]["codex.truncation_policy"] == "disabled"
+    assert payload["parameters"] == "num_ctx 1000000"
+    assert "display_name" not in payload
+    assert "description" not in payload
+    assert "service_tiers" not in payload
+    assert "default_reasoning_level" not in payload
+
+
+def test_ollama_show_preserves_existing_capabilities_without_vision(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    catalog_body = {
+        "models": [
+            {
+                "slug": "gpt-5.4",
+                "display_name": "GPT-5.4",
+                "input_modalities": ["text"],
+            }
+        ]
+    }
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get(settings.backend_models_url).mock(return_value=Response(200, json=catalog_body))
+        with TestClient(app) as client:
+            response = client.post("/api/show", json={"model": "gpt-5.4"})
+
+    assert response.status_code == 200
+    assert response.json()["capabilities"] == ["completion", "tools", "thinking"]
+
+
+def test_ollama_show_adds_vision_from_support_flag_without_new_top_level_fields(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    catalog_body = {
+        "models": [
+            {
+                "slug": "gpt-5.4",
+                "display_name": "GPT-5.4",
+                "supports_image": True,
+            }
+        ]
+    }
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get(settings.backend_models_url).mock(return_value=Response(200, json=catalog_body))
+        with TestClient(app) as client:
+            response = client.post("/api/show", json={"model": "gpt-5.4"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert sorted(payload.keys()) == [
+        "capabilities",
+        "details",
+        "license",
+        "model_info",
+        "modelfile",
+        "modified_at",
+        "parameters",
+        "requires",
+        "template",
+        "tensors",
+    ]
+    assert payload["capabilities"] == ["completion", "tools", "thinking", "vision"]
+
+
+def test_ollama_show_normalizes_latest_suffix(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/api/show", json={"model": "gpt-5.4:latest"})
+
+    assert response.status_code == 200
+    assert response.json()["model_info"]["general.basename"] == "gpt-5.4"
+
+
+def test_ollama_show_unknown_model_returns_404(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/api/show", json={"model": "missing-model:latest"})
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "model 'missing-model' not found"}
+
+
+def test_ollama_show_accepts_legacy_name_field(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/api/show", json={"name": "gpt-5.4"})
+
+    assert response.status_code == 200
+    assert response.json()["model_info"]["general.basename"] == "gpt-5.4"
+
+
+def test_ollama_ps_returns_fallback_models_with_synthetic_runtime_fields(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/api/ps")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert sorted(payload.keys()) == ["models"]
+    assert len(payload["models"]) == 10
+    first_model = payload["models"][0]
+    assert sorted(first_model.keys()) == [
+        "details",
+        "digest",
+        "expires_at",
+        "model",
+        "name",
+        "size",
+        "size_vram",
+    ]
+    assert first_model["model"] == first_model["name"]
+    assert first_model["details"]["format"] == "proxy"
+    assert first_model["size"] == 0
+    assert first_model["digest"] == ""
+    assert first_model["size_vram"] == 0
+    assert first_model["expires_at"].endswith("Z")
+
+
+def test_ollama_ps_uses_context_window_from_backend_catalog(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    catalog_body = {
+        "models": [
+            {
+                "slug": "gpt-5.4",
+                "display_name": "gpt-5.4",
+                "context_window": 272000,
+                "max_context_window": 1000000,
+                "size_vram": 8192,
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+            {
+                "slug": "gpt-5.3-codex",
+                "display_name": "gpt-5.3-codex",
+                "context_window": 272000,
+            },
+        ]
+    }
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get(settings.backend_models_url).mock(
+            return_value=Response(200, json=catalog_body)
+        )
+        with TestClient(app) as client:
+            response = client.get("/api/ps")
+
+    assert response.status_code == 200
+    payload = response.json()
+    models = {item["model"]: item for item in payload["models"]}
+    assert models["gpt-5.4"]["context_length"] == 1000000
+    assert models["gpt-5.4"]["size_vram"] == 8192
+    assert models["gpt-5.4"]["expires_at"].endswith("Z")
+    assert models["gpt-5.4-high"]["context_length"] == 1000000
+
+
+def test_ollama_model_details_normalizes_family_like_real_ollama() -> None:
+    details = ollama_model_details("qwen3.5:latest")
+
+    assert details["family"] == "qwen35"
+    assert details["families"] == ["qwen35"]
+
+
+def test_ollama_show_uses_codex_family_key_for_codex_models(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    catalog_body = {
+        "models": [
+            {
+                "slug": "gpt-5.3-codex",
+                "display_name": "gpt-5.3-codex",
+                "context_window": 272000,
+            }
+        ]
+    }
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get(settings.backend_models_url).mock(
+            return_value=Response(200, json=catalog_body)
+        )
+        with TestClient(app) as client:
+            response = client.post("/api/show", json={"model": "gpt-5.3-codex"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["details"]["family"] == "codex"
+    assert payload["model_info"]["general.context_length"] == 272000
+    assert payload["model_info"]["codex.context_length"] == 272000
+    assert payload["parameters"] == "num_ctx 272000"
+
+
 def test_ollama_chat_route(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
@@ -52,13 +432,14 @@ def test_ollama_chat_route(tmp_path: Path) -> None:
             return_value=Response(200, text=backend_sse_body())
         )
         with TestClient(app) as client:
-            response = client.post(
-                "/api/chat",
-                json={
-                    "model": "gpt-5.4:latest",
-                    "messages": [{"role": "user", "content": "hello"}],
-                },
-            )
+                response = client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4:latest",
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
 
     assert response.status_code == 200
     payload = response.json()
@@ -94,14 +475,15 @@ def test_ollama_chat_route_forwards_tools_and_returns_tool_calls(tmp_path: Path)
             return_value=Response(200, text=backend_tool_call_body())
         )
         with TestClient(app) as client:
-            response = client.post(
-                "/api/chat",
-                json={
-                    "model": "gpt-5.4",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "tools": request_tools,
-                },
-            )
+                response = client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "tools": request_tools,
+                    },
+                )
 
     assert response.status_code == 200
     payload = response.json()
@@ -129,14 +511,15 @@ def test_ollama_chat_think_false_maps_to_none_reasoning(tmp_path: Path) -> None:
             return_value=Response(200, text=backend_sse_body())
         )
         with TestClient(app) as client:
-            response = client.post(
-                "/api/chat",
-                json={
-                    "model": "gpt-5.4",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "think": False,
-                },
-            )
+                response = client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "think": False,
+                        "stream": False,
+                    },
+                )
 
     assert response.status_code == 200
     backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
@@ -154,18 +537,19 @@ def test_ollama_generate_think_xhigh_maps_to_backend_reasoning(tmp_path: Path) -
             return_value=Response(200, text=backend_sse_body())
         )
         with TestClient(app) as client:
-            response = client.post(
-                "/api/generate",
-                json={
-                    "model": "gpt-5.3-codex",
-                    "prompt": "hello",
-                    "think": "xhigh",
-                },
-            )
+                response = client.post(
+                    "/api/generate",
+                    json={
+                        "model": "gpt-5.3-codex",
+                        "prompt": "hello",
+                        "think": "xhigh",
+                        "stream": False,
+                    },
+                )
 
     assert response.status_code == 200
     backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
-    assert backend_payload["reasoning"] == {"effort": "xhigh"}
+    assert backend_payload["reasoning"] == {"summary": "auto", "effort": "xhigh"}
 
 
 def test_ollama_chat_think_true_maps_to_medium_reasoning(tmp_path: Path) -> None:
@@ -179,18 +563,131 @@ def test_ollama_chat_think_true_maps_to_medium_reasoning(tmp_path: Path) -> None
             return_value=Response(200, text=backend_sse_body())
         )
         with TestClient(app) as client:
-            response = client.post(
-                "/api/chat",
-                json={
-                    "model": "gpt-5.4",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "think": True,
-                },
-            )
+                response = client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "think": True,
+                        "stream": False,
+                    },
+                )
 
     assert response.status_code == 200
     backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
-    assert backend_payload["reasoning"] == {"effort": "medium"}
+    assert backend_payload["reasoning"] == {"summary": "auto", "effort": "medium"}
+
+
+def test_ollama_chat_non_streaming_returns_thinking(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"Think first."}]}}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Hello from ollama"}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+                response = client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4:latest",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "think": True,
+                        "stream": False,
+                    },
+                )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["message"]["thinking"] == "Think first."
+    assert payload["message"]["content"] == "Hello from ollama"
+
+
+def test_ollama_generate_non_streaming_returns_thinking(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"Think first."}]}}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Hello from ollama"}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+                response = client.post(
+                    "/api/generate",
+                    json={
+                        "model": "gpt-5.4:latest",
+                        "prompt": "hello",
+                        "think": True,
+                        "stream": False,
+                    },
+                )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["thinking"] == "Think first."
+    assert payload["response"] == "Hello from ollama"
+
+
+def test_ollama_chat_non_streaming_returns_thinking_and_tool_calls(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"Think first."}]}}\n\n'
+        'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"list_files","arguments":"{\\"path\\":\\".\\",\\"recursive\\":false}"}}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+                response = client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "list_files",
+                                "description": "List files",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                        ],
+                        "think": True,
+                        "stream": False,
+                    },
+                )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["message"]["thinking"] == "Think first."
+    assert payload["message"]["tool_calls"][0]["function"]["name"] == "list_files"
 
 
 def test_ollama_generate_route_streaming(tmp_path: Path) -> None:
@@ -218,6 +715,54 @@ def test_ollama_generate_route_streaming(tmp_path: Path) -> None:
     assert '"done":true' in response.text
 
 
+def test_ollama_chat_streams_by_default_when_stream_is_omitted(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_sse_body())
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-5.4:latest",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+    assert '"done":true' in response.text
+
+
+def test_ollama_generate_streams_by_default_when_stream_is_omitted(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_sse_body())
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/generate",
+                json={
+                    "model": "gpt-5.4:latest",
+                    "prompt": "hello",
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+    assert '"done":true' in response.text
+
+
 def test_ollama_non_streaming_validation_error_maps_to_ollama_error(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
@@ -227,11 +772,49 @@ def test_ollama_non_streaming_validation_error_maps_to_ollama_error(tmp_path: Pa
     with TestClient(app) as client:
         response = client.post(
             "/api/generate",
-            json={"model": "gpt-5.4:latest"},
+            json={"model": "gpt-5.4:latest", "stream": False},
         )
 
     assert response.status_code == 400
     assert "missing prompt or messages" in response.json()["error"]
+
+
+def test_ollama_chat_unknown_model_returns_native_not_found_error(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat",
+            json={
+                "model": "missing-model:latest",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "model 'missing-model' not found"}
+
+
+def test_ollama_generate_unknown_model_returns_native_not_found_error(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/generate",
+            json={
+                "model": "missing-model:latest",
+                "prompt": "hello",
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "model 'missing-model' not found"}
 
 
 def test_ollama_streaming_validation_error_maps_to_ndjson_error(tmp_path: Path) -> None:
@@ -269,3 +852,75 @@ def test_ollama_invalid_think_value_rejected(tmp_path: Path) -> None:
 
     assert response.status_code == 422
     assert "think must be one of" in response.text
+
+
+def test_ollama_non_streaming_backend_failed_event_surfaces_backend_message(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'event: response.created\n'
+        'data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress","output":[]}}\n\n'
+        'event: error\n'
+        'data: {"type":"error","message":"Your input exceeds the context window of this model.","code":"context_length_exceeded","type":"invalid_request_error","param":"messages"}\n\n'
+        'event: response.failed\n'
+        'data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}}\n\n'
+        'data: [DONE]\n\n'
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+                response = client.post(
+                    "/api/generate",
+                    json={
+                        "model": "gpt-5.4:latest",
+                        "prompt": "hello",
+                        "stream": False,
+                    },
+                )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "Your input exceeds the context window of this model."}
+
+
+def test_ollama_streaming_backend_failed_event_surfaces_backend_message(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'event: response.created\n'
+        'data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress","output":[]}}\n\n'
+        'event: error\n'
+        'data: {"type":"error","message":"Your input exceeds the context window of this model.","code":"context_length_exceeded","type":"invalid_request_error","param":"messages"}\n\n'
+        'event: response.failed\n'
+        'data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}}\n\n'
+        'data: [DONE]\n\n'
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/generate",
+                json={
+                    "model": "gpt-5.4:latest",
+                    "prompt": "hello",
+                    "stream": True,
+                },
+            )
+
+    assert response.status_code == 200
+    assert '{"error":"Your input exceeds the context window of this model."}' in response.text

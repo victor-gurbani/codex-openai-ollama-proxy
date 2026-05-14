@@ -86,5 +86,6 @@ class ChatCompletionsResponse(BaseModel):
     object: str
     created: int
     model: str
+    system_fingerprint: str | None = None
     choices: list[Choice]
     usage: Usage | None = None

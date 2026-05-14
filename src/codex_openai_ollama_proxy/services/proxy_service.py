@@ -84,6 +84,7 @@ class ProxyService:
             object="chat.completion",
             created=int(datetime.now(UTC).timestamp()),
             model=requested_model,
+            system_fingerprint="fp_ollama",
             choices=[
                 Choice(
                     index=0,
@@ -113,6 +114,7 @@ class ProxyService:
 
         formatter = OpenAIStreamFormatter(requested_model)
         state = StreamState()
+        include_usage = should_include_stream_usage(chat_req)
 
         async def iterator() -> AsyncIterator[str]:
             disconnected = False
@@ -174,7 +176,9 @@ class ProxyService:
                     "Empty content and no tool calls returned from ChatGPT backend"
                 )
 
-            yield formatter.final_chunk(state.finish_reason, state.usage)
+            yield formatter.final_chunk(state.finish_reason)
+            if include_usage and state.usage is not None:
+                yield formatter.usage_chunk(state.usage)
             yield formatter.done_chunk()
 
         return iterator()
@@ -455,6 +459,13 @@ class ProxyService:
 
 def normalize_ollama_model(model: str) -> str:
     return model[:-7] if model.endswith(":latest") else model
+
+
+def should_include_stream_usage(chat_req: ChatCompletionsRequest) -> bool:
+    stream_options = getattr(chat_req, "stream_options", None)
+    if not isinstance(stream_options, dict):
+        return False
+    return stream_options.get("include_usage") is True
 
 
 def build_responses_text_config(response_format: Any) -> Any:

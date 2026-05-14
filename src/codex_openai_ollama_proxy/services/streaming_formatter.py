@@ -19,12 +19,14 @@ def build_openai_sse_response(
 ) -> str:
     chunk_id = f"chatcmpl-{uuid4()}"
     created = int(datetime.now(UTC).timestamp())
+    system_fingerprint = "fp_ollama"
 
     role_chunk = {
         "id": chunk_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
+        "system_fingerprint": system_fingerprint,
         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
     }
 
@@ -36,6 +38,7 @@ def build_openai_sse_response(
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
+            "system_fingerprint": system_fingerprint,
             "choices": [{"index": 0, "delta": {"content": message}, "finish_reason": None}],
         }
         chunks.append(f"data: {json.dumps(content_chunk, separators=(',', ':'))}\n\n")
@@ -46,6 +49,7 @@ def build_openai_sse_response(
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
+            "system_fingerprint": system_fingerprint,
             "choices": [{"index": 0, "delta": {"tool_calls": [tool.model_dump(by_alias=True) for tool in tool_calls]}, "finish_reason": None}],
         }
         chunks.append(f"data: {json.dumps(tool_calls_chunk, separators=(',', ':'))}\n\n")
@@ -55,12 +59,22 @@ def build_openai_sse_response(
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
+        "system_fingerprint": system_fingerprint,
         "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
     }
-    if usage is not None:
-        final_chunk["usage"] = usage.model_dump()
 
     chunks.append(f"data: {json.dumps(final_chunk, separators=(',', ':'))}\n\n")
+    if usage is not None:
+        usage_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "system_fingerprint": system_fingerprint,
+            "choices": [],
+            "usage": usage.model_dump(),
+        }
+        chunks.append(f"data: {json.dumps(usage_chunk, separators=(',', ':'))}\n\n")
     chunks.append("data: [DONE]\n\n")
     return "".join(chunks)
 
@@ -70,6 +84,7 @@ class OpenAIStreamFormatter:
         self.model = model
         self.chunk_id = f"chatcmpl-{uuid4()}"
         self.created = int(datetime.now(UTC).timestamp())
+        self.system_fingerprint = "fp_ollama"
 
     def role_chunk(self) -> str:
         payload = {
@@ -77,6 +92,7 @@ class OpenAIStreamFormatter:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
+            "system_fingerprint": self.system_fingerprint,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         }
         return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
@@ -87,6 +103,7 @@ class OpenAIStreamFormatter:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
+            "system_fingerprint": self.system_fingerprint,
             "choices": [
                 {
                     "index": 0,
@@ -103,6 +120,7 @@ class OpenAIStreamFormatter:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
+            "system_fingerprint": self.system_fingerprint,
             "choices": [
                 {
                     "index": 0,
@@ -132,6 +150,7 @@ class OpenAIStreamFormatter:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
+            "system_fingerprint": self.system_fingerprint,
             "choices": [
                 {
                     "index": 0,
@@ -152,6 +171,7 @@ class OpenAIStreamFormatter:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
+            "system_fingerprint": self.system_fingerprint,
             "choices": [
                 {
                     "index": 0,
@@ -172,12 +192,13 @@ class OpenAIStreamFormatter:
         }
         return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
-    def final_chunk(self, finish_reason: str, usage: Usage | None) -> str:
+    def final_chunk(self, finish_reason: str) -> str:
         payload = {
             "id": self.chunk_id,
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
+            "system_fingerprint": self.system_fingerprint,
             "choices": [
                 {
                     "index": 0,
@@ -186,8 +207,18 @@ class OpenAIStreamFormatter:
                 }
             ],
         }
-        if usage is not None:
-            payload["usage"] = usage.model_dump()
+        return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+    def usage_chunk(self, usage: Usage) -> str:
+        payload = {
+            "id": self.chunk_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "system_fingerprint": self.system_fingerprint,
+            "choices": [],
+            "usage": usage.model_dump(),
+        }
         return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
     @staticmethod

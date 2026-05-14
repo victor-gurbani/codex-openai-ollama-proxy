@@ -62,6 +62,7 @@ def test_openai_chat_completions_route(tmp_path: Path) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["model"] == "gpt-5.4"
+    assert payload["system_fingerprint"] == "fp_ollama"
     assert payload["choices"][0]["message"]["content"] == "Hello world"
     assert payload["usage"]["total_tokens"] == 7
     assert route.calls.last.request.headers["authorization"] == "Bearer backend_key"

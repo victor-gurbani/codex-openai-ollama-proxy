@@ -61,7 +61,8 @@ def test_openai_streaming_preserves_chunk_order(tmp_path: Path) -> None:
     assert first_delta_index != -1
     assert second_delta_index > first_delta_index
     assert final_index > second_delta_index
-    assert '"total_tokens":6' in body
+    assert '"system_fingerprint":"fp_ollama"' in body
+    assert '"total_tokens":6' not in body
     assert "data: [DONE]" in body
 
 
@@ -90,6 +91,7 @@ def test_openai_streaming_emits_tool_call_snapshot_before_done(tmp_path: Path) -
                 json={
                     "model": "gpt-5.4",
                     "stream": True,
+                    "stream_options": {"include_usage": True},
                     "messages": [{"role": "user", "content": "hello"}],
                     "tools": [
                         {
@@ -109,7 +111,41 @@ def test_openai_streaming_emits_tool_call_snapshot_before_done(tmp_path: Path) -
     assert body.find(tool_chunk) != -1
     assert body.count('"tool_calls":[') == 1
     assert body.find('"finish_reason":"tool_calls"') > body.find(tool_chunk)
+    assert '"choices":[],"usage":{' in body
     assert "data: [DONE]" in body
+
+
+def test_openai_streaming_emits_usage_chunk_only_when_requested(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-5.4",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"choices":[],"usage":{' in body
+    assert '"total_tokens":6' in body
 
 
 def test_openai_streaming_reasoning_only_backend_response_emits_reasoning_deltas(tmp_path: Path) -> None:

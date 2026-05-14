@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 import json
 from typing import Any
 from uuid import uuid4
 
 from codex_openai_ollama_proxy.schemas.openai import ChatMessage, ChatMessageToolCall
+
+
+@dataclass(slots=True)
+class PendingToolCall:
+    call_id: str
+    name: str
 
 
 def normalize_function_arguments(arguments: Any) -> str:
@@ -93,14 +100,14 @@ def convert_tool_choice(tool_choice: Any) -> Any:
 
 def assistant_tool_calls_to_input(
     tool_calls: list[ChatMessageToolCall] | None,
-    pending_ids: deque[str],
+    pending_calls: deque[PendingToolCall],
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for tool_call in tool_calls or []:
         if tool_call.call_type and tool_call.call_type.lower() != "function":
             continue
         call_id = tool_call.id or f"call_{uuid4()}"
-        pending_ids.append(call_id)
+        pending_calls.append(PendingToolCall(call_id=call_id, name=tool_call.function.name))
         items.append(
             {
                 "type": "function_call",
@@ -113,12 +120,52 @@ def assistant_tool_calls_to_input(
     return items
 
 
+def _pop_pending_by_call_id(
+    pending_calls: deque[PendingToolCall], call_id: str
+) -> PendingToolCall | None:
+    for pending_call in pending_calls:
+        if pending_call.call_id == call_id:
+            pending_calls.remove(pending_call)
+            return pending_call
+    return None
+
+
+def _pop_pending_by_tool_name(
+    pending_calls: deque[PendingToolCall], tool_name: str
+) -> PendingToolCall | None:
+    for pending_call in pending_calls:
+        if pending_call.name == tool_name:
+            pending_calls.remove(pending_call)
+            return pending_call
+    return None
+
+
 def tool_message_to_output(
     message: ChatMessage,
-    pending_ids: deque[str],
+    pending_calls: deque[PendingToolCall],
     output: str,
 ) -> dict[str, Any]:
-    call_id = message.tool_call_id or (pending_ids.popleft() if pending_ids else None)
+    pending_call: PendingToolCall | None = None
+    tool_name = message.tool_name
+
+    if message.tool_call_id is not None:
+        pending_call = _pop_pending_by_call_id(pending_calls, message.tool_call_id)
+    elif tool_name is not None:
+        pending_call = _pop_pending_by_tool_name(pending_calls, tool_name)
+    elif pending_calls:
+        pending_call = pending_calls.popleft()
+
+    call_id = (
+        message.tool_call_id
+        or (pending_call.call_id if pending_call is not None else None)
+    )
     if call_id is None:
         call_id = f"call_{uuid4()}"
-    return {"type": "function_call_output", "call_id": call_id, "output": output}
+
+    if tool_name is None and pending_call is not None:
+        tool_name = pending_call.name
+
+    payload = {"type": "function_call_output", "call_id": call_id, "output": output}
+    if tool_name is not None:
+        payload["name"] = tool_name
+    return payload

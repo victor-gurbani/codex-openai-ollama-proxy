@@ -32,14 +32,28 @@ class FakeCatalogBackendClient:
         self._responses = list(responses)
         self.calls = 0
 
-    async def fetch_codex_model_slugs(self, client_version: str) -> list[str]:  # noqa: ARG002
+    def _next_response(self) -> object:
         self.calls += 1
         if not self._responses:
             raise RuntimeError("no response configured")
         response = self._responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return list(response)
+        return response
+
+    async def fetch_codex_models(self, client_version: str):  # noqa: ARG002
+        response = self._next_response()
+        models: list[dict[str, object]] = []
+        for item in response:
+            if isinstance(item, str):
+                models.append({"slug": item})
+            elif isinstance(item, dict):
+                models.append(dict(item))
+        return models
+
+    async def fetch_codex_model_slugs(self, client_version: str) -> list[str]:  # noqa: ARG002
+        models = await self.fetch_codex_models(client_version)
+        return [str(model["slug"]) for model in models]
 
 
 @pytest.mark.asyncio
@@ -68,6 +82,25 @@ async def test_model_catalog_uses_static_fallback_on_cold_start_failure(tmp_path
     catalog = ModelCatalogService(settings, backend_client)  # type: ignore[arg-type]
 
     assert await catalog.get_base_models() == ["gpt-5.4", "gpt-5.3-codex"]
+
+
+@pytest.mark.asyncio
+async def test_model_catalog_preserves_context_metadata_for_model_requests(
+    tmp_path: Path,
+) -> None:
+    settings = build_settings(tmp_path / "auth.json")
+    backend_client = FakeCatalogBackendClient(
+        [[
+            {"slug": "gpt-5.4", "context_window": 272000},
+            {"slug": "gpt-5.3-codex", "context_window": 272000},
+        ]]
+    )
+    catalog = ModelCatalogService(settings, backend_client)  # type: ignore[arg-type]
+
+    assert await catalog.get_base_models() == ["gpt-5.4", "gpt-5.3-codex"]
+    metadata = await catalog.get_model_metadata_for_request("gpt-5.4-high")
+    assert metadata is not None
+    assert metadata["context_window"] == 272000
 
 
 def test_models_and_tags_routes_expose_dynamic_models(tmp_path: Path) -> None:

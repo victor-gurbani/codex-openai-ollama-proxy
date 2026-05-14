@@ -91,7 +91,7 @@ class Settings:
     ollama_compat_version: str = DEFAULT_OLLAMA_COMPAT_VERSION
     public_paths: frozenset[str] = field(
         default_factory=lambda: frozenset(
-            {"/health", "/api/tags", "/chat-test", "/chat-test.html"}
+            {"/health", "/api/tags", "/api/ps", "/chat-test", "/chat-test.html"}
         )
     )
 

@@ -87,7 +87,7 @@ PORT=11434
 
 규칙:
 
-1. `API_KEY`가 설정되어 있으면 `/health`와 `/api/tags`는 공개 상태를 유지하고, 나머지는 해당 key가 필요합니다.
+1. `API_KEY`가 설정되어 있으면 `/health`, `/api/tags`, `/api/ps`는 공개 상태를 유지하고, 나머지는 해당 key가 필요합니다.
 2. `API_KEY`가 설정되어 있지 않으면 프록시는 인증 없이 접근을 허용합니다. `.env`로 별도 override하지 않았을 때의 기본 동작입니다.
 
 ## 엔드포인트 정책
@@ -96,6 +96,7 @@ PORT=11434
 
 - `GET /health`
 - `GET /api/tags`
+- `GET /api/ps`
 
 `API_KEY`가 설정되어 있을 때 보호:
 
@@ -125,8 +126,16 @@ Ollama 호환:
 - `GET /health`
 - `GET /api/version`
 - `GET /api/tags`
+- `GET /api/ps`
 - `POST /api/chat`
 - `POST /api/generate`
+
+`GET /api/ps`는 Ollama 클라이언트 호환을 위한 엔드포인트입니다. 다만 실제 로컬 Ollama runtime처럼 모델의 메모리 상주 상태나 VRAM 사용량을 알 수는 없기 때문에, 일부 필드는 synthetic 값입니다.
+
+- `expires_at`: 프록시의 catalog freshness 기준으로 생성한 synthetic timestamp
+- `size_vram`: upstream metadata가 없으면 `0`
+- `size` / `digest`: 기존 `/api/tags`와 마찬가지로 placeholder 값
+- `context_length`: 알 수 있을 때는 실제 Codex 모델 metadata 값 사용
 
 ## 모델 별칭
 

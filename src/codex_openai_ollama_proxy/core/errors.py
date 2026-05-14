@@ -22,7 +22,27 @@ class EmptyBackendResponseError(ProxyError):
     """Raised when backend emits no text and no tool calls."""
 
 
+class BackendSSEError(ProxyError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 502,
+        error_type: str | None = None,
+        param: str | None = None,
+        code: str | None = None,
+    ):
+        self.message = message
+        self.status_code = status_code
+        self.error_type = error_type
+        self.param = param
+        self.code = code
+        super().__init__(message)
+
+
 def status_code_for_error(exc: Exception) -> int:
+    if isinstance(exc, BackendSSEError):
+        return exc.status_code
     if isinstance(exc, BackendHTTPError):
         return exc.status_code
     if isinstance(exc, ValueError):
@@ -37,6 +57,21 @@ def status_code_for_error(exc: Exception) -> int:
 
 
 def openai_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, BackendSSEError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+            },
+            content={
+                "error": {
+                    "message": exc.message,
+                    "type": exc.error_type or "invalid_request_error",
+                    "param": exc.param,
+                    "code": exc.code,
+                }
+            },
+        )
     return JSONResponse(
         status_code=status_code_for_error(exc),
         headers={
@@ -53,6 +88,14 @@ def openai_error_response(exc: Exception) -> JSONResponse:
 
 
 def ollama_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, BackendSSEError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+            },
+            content={"error": exc.message},
+        )
     return JSONResponse(
         status_code=status_code_for_error(exc),
         headers={

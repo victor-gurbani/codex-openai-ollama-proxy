@@ -89,7 +89,7 @@ If you set `DEBUG=true`, the proxy writes request/response trace logs for the ba
 
 Rules:
 
-1. If `API_KEY` is set, `/health` and `/api/tags` stay public and the rest require that key.
+1. If `API_KEY` is set, `/health`, `/api/tags`, and `/api/ps` stay public and the rest require that key.
 2. If `API_KEY` is not set, the proxy allows unauthenticated access. This is the default when you have no `.env` override.
 
 ## Endpoint Policy
@@ -98,6 +98,7 @@ Public when `API_KEY` is configured:
 
 - `GET /health`
 - `GET /api/tags`
+- `GET /api/ps`
 
 Protected when `API_KEY` is configured:
 
@@ -127,8 +128,16 @@ Ollama-compatible:
 - `GET /health`
 - `GET /api/version`
 - `GET /api/tags`
+- `GET /api/ps`
 - `POST /api/chat`
 - `POST /api/generate`
+
+`GET /api/ps` is a compatibility endpoint for Ollama-aware clients. Unlike a real local Ollama runtime, this proxy does not know actual loaded-model residency or VRAM usage, so some fields are synthetic:
+
+- `expires_at`: synthetic timestamp derived from proxy catalog freshness
+- `size_vram`: `0` unless upstream metadata provides a value
+- `size` / `digest`: placeholder values, like the existing `/api/tags` response
+- `context_length`: real Codex model metadata when available
 
 ## Model Aliases
 

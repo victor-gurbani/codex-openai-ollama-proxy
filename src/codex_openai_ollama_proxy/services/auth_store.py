@@ -5,6 +5,7 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -22,10 +23,30 @@ class AuthStore:
     def auth_path(self) -> Path:
         return self._auth_path
 
-    async def snapshot(self) -> AuthData:
+    async def snapshot(self, *, force_reload: bool = False) -> AuthData:
         async with self._lock:
-            current = await self._load_locked()
+            current = await self._load_locked(force_reload=force_reload)
             return current.model_copy(deep=True)
+
+    @staticmethod
+    def _dump_auth_data(auth_data: AuthData) -> dict[str, Any]:
+        return auth_data.model_dump(by_alias=True, exclude_none=False)
+
+    async def _reload_locked_if_changed(self, current: AuthData) -> AuthData | None:
+        reloaded = await asyncio.to_thread(self._read_from_disk)
+        current_tokens = current.tokens
+        reloaded_tokens = reloaded.tokens
+        if current_tokens is not None:
+            if reloaded_tokens is None:
+                return None
+            if reloaded_tokens.account_id != current_tokens.account_id:
+                return None
+
+        if self._dump_auth_data(reloaded) == self._dump_auth_data(current):
+            return None
+
+        self._cached = reloaded
+        return reloaded.model_copy(deep=True)
 
     async def refresh_access_token_if_needed(
         self,
@@ -36,6 +57,9 @@ class AuthStore:
     ) -> AuthData:
         async with self._lock:
             current = await self._load_locked()
+            reloaded = await self._reload_locked_if_changed(current)
+            if reloaded is not None:
+                current = reloaded
             tokens = current.tokens
             if tokens is None:
                 raise AuthenticationRefreshError("No token auth configured in auth.json")
@@ -58,9 +82,33 @@ class AuthStore:
             )
 
             if response.is_error:
-                raise AuthenticationRefreshError(
-                    f"Codex OAuth refresh failed {response.status_code}: {response.text}"
-                )
+                reloaded = await self._reload_locked_if_changed(current)
+                if reloaded is not None:
+                    current = reloaded
+                    tokens = current.tokens
+                    if tokens is None:
+                        raise AuthenticationRefreshError("No token auth configured in auth.json")
+                    if tokens.access_token != previous_access_token:
+                        return current.model_copy(deep=True)
+                    if not tokens.refresh_token:
+                        raise AuthenticationRefreshError("refresh_token missing in auth.json")
+
+                    refresh_token = tokens.refresh_token
+                    fallback_account_id = tokens.account_id
+                    response = await client.post(
+                        oauth_token_url,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        data={
+                            "grant_type": "refresh_token",
+                            "refresh_token": refresh_token,
+                            "client_id": codex_client_id,
+                        },
+                    )
+
+                if response.is_error:
+                    raise AuthenticationRefreshError(
+                        f"Codex OAuth refresh failed {response.status_code}: {response.text}"
+                    )
 
             payload = TokenRefreshResponse.model_validate(response.json())
             next_access_token = (payload.access_token or "").strip()
@@ -87,8 +135,8 @@ class AuthStore:
             await self._persist_locked(updated)
             return updated.model_copy(deep=True)
 
-    async def _load_locked(self) -> AuthData:
-        if self._cached is None:
+    async def _load_locked(self, *, force_reload: bool = False) -> AuthData:
+        if force_reload or self._cached is None:
             self._cached = await asyncio.to_thread(self._read_from_disk)
         return self._cached
 

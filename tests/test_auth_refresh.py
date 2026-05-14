@@ -83,3 +83,86 @@ def test_refreshes_token_and_retries(tmp_path: Path) -> None:
     assert refreshed["tokens"]["access_token"] == "new_access"
     assert refreshed["tokens"]["refresh_token"] == "new_refresh"
     assert refreshed["last_refresh"]
+
+
+def test_reloads_auth_file_after_reused_refresh_token_without_restart(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(
+        auth_path,
+        {
+            "tokens": {
+                "access_token": "old_access",
+                "refresh_token": "stale_refresh",
+                "account_id": "acct_1",
+            }
+        },
+    )
+
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+    backend_body = (
+        'data: {"type":"response.output_text.delta","delta":"Recovered after reload"}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    refresh_attempts = 0
+
+    def refresh_side_effect(request):  # noqa: ARG001
+        nonlocal refresh_attempts
+        refresh_attempts += 1
+        if refresh_attempts == 1:
+            write_auth_file(
+                auth_path,
+                {
+                    "tokens": {
+                        "access_token": "disk_access",
+                        "refresh_token": "disk_refresh",
+                        "account_id": "acct_1",
+                    }
+                },
+            )
+            return Response(
+                401,
+                json={
+                    "error": {
+                        "message": "Your refresh token has already been used to generate a new access token. Please try signing in again.",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "refresh_token_reused",
+                    }
+                },
+            )
+        raise AssertionError("refresh endpoint should not be called twice")
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        backend_route = respx_mock.post(settings.backend_responses_url).mock(
+            side_effect=[
+                Response(401, text="expired"),
+                Response(200, text=backend_body),
+            ]
+        )
+        refresh_route = respx_mock.post(settings.oauth_token_url).mock(
+            side_effect=refresh_side_effect
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-5.4",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["choices"][0]["message"]["content"] == "Recovered after reload"
+        assert backend_route.call_count == 2
+        assert refresh_route.call_count == 1
+
+    refreshed = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert refreshed["tokens"]["access_token"] == "disk_access"
+    assert refreshed["tokens"]["refresh_token"] == "disk_refresh"

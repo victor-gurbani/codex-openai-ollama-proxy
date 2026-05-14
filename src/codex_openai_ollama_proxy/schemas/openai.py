@@ -25,6 +25,7 @@ class ChatMessageToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: Any = None
+    images: list[str] | None = None
     thinking: str | None = None
     reasoning: str | None = None
     tool_name: str | None = None

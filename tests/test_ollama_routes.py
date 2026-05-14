@@ -817,6 +817,73 @@ def test_ollama_generate_unknown_model_returns_native_not_found_error(tmp_path: 
     assert response.json() == {"error": "model 'missing-model' not found"}
 
 
+def test_ollama_generate_translates_legacy_images_field_into_backend_input_images(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_sse_body())
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/generate",
+                json={
+                    "model": "gpt-5.4",
+                    "prompt": "describe this",
+                    "images": ["QUJD"],
+                    "stream": False,
+                },
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["input"][0]["content"] == [
+        {"type": "input_text", "text": "describe this"},
+        {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+    ]
+
+
+def test_ollama_chat_translates_message_images_field_into_backend_input_images(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_sse_body())
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-5.4",
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "describe this",
+                            "images": ["QUJD"],
+                        }
+                    ],
+                },
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["input"][0]["content"] == [
+        {"type": "input_text", "text": "describe this"},
+        {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+    ]
+
+
 def test_ollama_streaming_validation_error_maps_to_ndjson_error(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})

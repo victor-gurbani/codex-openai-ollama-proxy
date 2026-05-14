@@ -237,6 +237,7 @@ class ProxyService:
             model=request.model,
             messages=request.messages,
             prompt=request.prompt,
+            images=request.images,
             system=request.system,
             stream=request.stream,
             think=request.think,
@@ -280,6 +281,7 @@ class ProxyService:
             model=request.model,
             messages=request.messages,
             prompt=request.prompt,
+            images=request.images,
             system=request.system,
             stream=request.stream,
             think=request.think,
@@ -361,6 +363,7 @@ class ProxyService:
             model=request.model,
             messages=request.messages,
             prompt=request.prompt,
+            images=request.images,
             system=request.system,
             stream=request.stream,
             think=request.think,
@@ -375,6 +378,7 @@ class ProxyService:
         model: str,
         messages: list[ChatMessage] | None,
         prompt: str | None,
+        images: list[str] | None,
         system: str | None,
         stream: bool | None,
         think: bool | str | None,
@@ -390,16 +394,46 @@ class ProxyService:
             else None
         )
 
+        def merge_images_into_content(content: Any, message_images: list[str] | None) -> Any:
+            if not message_images:
+                return content
+
+            parts: list[Any] = []
+            if isinstance(content, list):
+                parts.extend(content)
+            elif content is not None:
+                parts.append({"type": "text", "text": str(content)})
+
+            parts.extend(
+                {"type": "input_image", "image_base64": image}
+                for image in message_images
+            )
+            return parts
+
         if system and system.strip():
             resolved_messages.insert(
                 0,
                 ChatMessage(role="system", content=system),
             )
 
+        resolved_messages = [
+            message.model_copy(
+                update={
+                    "content": merge_images_into_content(message.content, message.images)
+                }
+            )
+            for message in resolved_messages
+        ]
+
         if not has_non_system_message(resolved_messages):
             if not prompt or not prompt.strip():
                 raise ValueError("missing prompt or messages")
-            resolved_messages.append(ChatMessage(role="user", content=prompt))
+            resolved_messages.append(
+                ChatMessage(
+                    role="user",
+                    content=merge_images_into_content(prompt, images),
+                )
+            )
 
         return ChatCompletionsRequest(
             model=normalized_model,

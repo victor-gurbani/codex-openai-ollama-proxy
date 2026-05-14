@@ -786,3 +786,102 @@ def test_openai_response_format_json_schema_maps_to_backend_text_format(
             "strict": True,
         }
     }
+
+
+def test_openai_appends_finalize_hint_for_tool_follow_up_turns(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    request_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_sse_body())
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-5.4",
+                    "messages": [
+                        {"role": "user", "content": "Audit the repo."},
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": {"filePath": "README.md"},
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "file contents",
+                        },
+                    ],
+                    "tools": request_tools,
+                },
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["parallel_tool_calls"] is True
+    assert backend_payload["instructions"].endswith(
+        "Only request another tool when the existing tool results are insufficient."
+    )
+
+
+def test_openai_non_streaming_moves_planning_text_into_reasoning_for_tool_turns(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.output_text.delta","delta":"I will read the file first."}\n\n'
+        'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":"{\\"filePath\\":\\"README.md\\"}"}}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-5.4",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "read_file", "parameters": {"type": "object"}},
+                        }
+                    ],
+                },
+            )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["choices"][0]["message"]["content"] == ""
+    assert payload["choices"][0]["message"]["reasoning"] == "I will read the file first."

@@ -49,6 +49,22 @@ from codex_openai_ollama_proxy.services.tool_conversion import (
     convert_tool_choice,
 )
 
+TOOL_FOLLOW_UP_FINALIZE_HINT = (
+    "\n\nIf the latest tool results already provide enough information to answer the user's "
+    "request, respond with the final answer directly instead of requesting more tools. "
+    "Only request another tool when the existing tool results are insufficient."
+)
+
+
+def normalize_tool_turn_reasoning(
+    content: str,
+    reasoning: str,
+    tool_calls: list[ChatToolCall],
+) -> tuple[str, str]:
+    if tool_calls and content and not reasoning:
+        return "", content
+    return content, reasoning
+
 
 class ProxyService:
     def __init__(
@@ -76,6 +92,11 @@ class ProxyService:
         response_content, response_thinking, response_tool_calls, usage = parse_backend_sse_text(
             response_text,
             allow_thinking_only=allow_thinking_only,
+        )
+        response_content, response_thinking = normalize_tool_turn_reasoning(
+            response_content,
+            response_thinking,
+            response_tool_calls,
         )
 
         finish_reason = "stop" if not response_tool_calls else "tool_calls"
@@ -119,6 +140,9 @@ class ProxyService:
         async def iterator() -> AsyncIterator[str]:
             disconnected = False
             last_tool_call_signature: str | None = None
+            buffered_content: list[str] = []
+            emitted_reasoning = False
+            saw_tool_calls = False
             if is_disconnected is not None and await is_disconnected():
                 return
             lines = await self._backend_client.stream_responses_request(responses_req)
@@ -147,18 +171,37 @@ class ProxyService:
                     )
                 emit = state.apply(event)
                 if isinstance(event, TextDeltaEvent) and emit:
-                    yield formatter.content_chunk(event.text)
+                    buffered_content.append(event.text)
                 elif isinstance(event, TextDoneEvent) and emit:
-                    yield formatter.content_chunk(event.text)
+                    buffered_content.append(event.text)
                 elif isinstance(event, ThinkingDeltaEvent) and emit:
+                    if buffered_content:
+                        for text in buffered_content:
+                            yield formatter.content_chunk(text)
+                        buffered_content.clear()
                     yield formatter.reasoning_chunk(event.text)
+                    emitted_reasoning = True
                 elif isinstance(event, ThinkingDoneEvent) and emit:
+                    if buffered_content:
+                        for text in buffered_content:
+                            yield formatter.content_chunk(text)
+                        buffered_content.clear()
                     yield formatter.reasoning_chunk(event.text)
+                    emitted_reasoning = True
                 elif (
                     isinstance(event, ToolCallChunkEvent)
                     and event.is_final
                     and state.tool_calls
                 ):
+                    if buffered_content and not emitted_reasoning:
+                        for text in buffered_content:
+                            yield formatter.reasoning_chunk(text)
+                        buffered_content.clear()
+                        emitted_reasoning = True
+                    elif buffered_content:
+                        for text in buffered_content:
+                            yield formatter.content_chunk(text)
+                        buffered_content.clear()
                     tool_call_signature = json.dumps(
                         [tool.model_dump(by_alias=True) for tool in state.tool_calls],
                         separators=(",", ":"),
@@ -167,6 +210,7 @@ class ProxyService:
                     if tool_call_signature != last_tool_call_signature:
                         yield formatter.tool_calls_chunk(state.tool_calls)
                         last_tool_call_signature = tool_call_signature
+                    saw_tool_calls = True
 
             if disconnected:
                 return
@@ -175,6 +219,11 @@ class ProxyService:
                 raise EmptyBackendResponseError(
                     "Empty content and no tool calls returned from ChatGPT backend"
                 )
+
+            if buffered_content:
+                chunk_writer = formatter.reasoning_chunk if saw_tool_calls and not emitted_reasoning else formatter.content_chunk
+                for text in buffered_content:
+                    yield chunk_writer(text)
 
             yield formatter.final_chunk(state.finish_reason)
             if include_usage and state.usage is not None:
@@ -206,6 +255,8 @@ class ProxyService:
             chat_req.messages,
             default_instructions=DEFAULT_SYSTEM_INSTRUCTIONS,
         )
+        if should_append_tool_finalize_hint(chat_req):
+            instructions += TOOL_FOLLOW_UP_FINALIZE_HINT
 
         responses_request = ResponsesApiRequest(
             model=backend_model,
@@ -213,7 +264,7 @@ class ProxyService:
             input=input_items,
             tools=converted_tools,
             tool_choice=converted_tool_choice,
-            parallel_tool_calls=False,
+            parallel_tool_calls=True,
             temperature=temperature,
             reasoning=reasoning,
             text=text_config,
@@ -466,6 +517,35 @@ def should_include_stream_usage(chat_req: ChatCompletionsRequest) -> bool:
     if not isinstance(stream_options, dict):
         return False
     return stream_options.get("include_usage") is True
+
+
+def should_append_tool_finalize_hint(chat_req: ChatCompletionsRequest) -> bool:
+    if not chat_req.tools:
+        return False
+
+    messages = chat_req.messages
+    if len(messages) < 2:
+        return False
+
+    trailing_tool_messages = 0
+    for message in reversed(messages):
+        if message.role.lower() == "tool":
+            trailing_tool_messages += 1
+            continue
+        break
+
+    if trailing_tool_messages == 0:
+        return False
+
+    assistant_index = len(messages) - trailing_tool_messages - 1
+    if assistant_index < 0:
+        return False
+
+    assistant_message = messages[assistant_index]
+    return (
+        assistant_message.role.lower() == "assistant"
+        and bool(assistant_message.tool_calls)
+    )
 
 
 def build_responses_text_config(response_format: Any) -> Any:

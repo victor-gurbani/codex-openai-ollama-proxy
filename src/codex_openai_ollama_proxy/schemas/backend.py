@@ -14,6 +14,7 @@ class ResponsesApiRequest(BaseModel):
     parallel_tool_calls: bool = False
     temperature: float | None = None
     reasoning: Any | None = None
+    text: Any | None = None
     store: bool = False
     stream: bool = True
     include: list[str] = Field(default_factory=list)

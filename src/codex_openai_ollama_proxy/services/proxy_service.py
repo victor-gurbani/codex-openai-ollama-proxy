@@ -197,6 +197,7 @@ class ProxyService:
         )
         converted_tools = convert_chat_tools_to_responses(chat_req.tools)
         converted_tool_choice = convert_tool_choice(chat_req.tool_choice)
+        text_config = build_responses_text_config(chat_req.response_format)
         input_items, instructions = convert_messages_to_input(
             chat_req.messages,
             default_instructions=DEFAULT_SYSTEM_INSTRUCTIONS,
@@ -211,6 +212,7 @@ class ProxyService:
             parallel_tool_calls=False,
             temperature=temperature,
             reasoning=reasoning,
+            text=text_config,
             store=False,
             stream=True,
             include=[],
@@ -238,6 +240,7 @@ class ProxyService:
             messages=request.messages,
             prompt=request.prompt,
             images=request.images,
+            format=request.format,
             system=request.system,
             stream=request.stream,
             think=request.think,
@@ -282,6 +285,7 @@ class ProxyService:
             messages=request.messages,
             prompt=request.prompt,
             images=request.images,
+            format=request.format,
             system=request.system,
             stream=request.stream,
             think=request.think,
@@ -364,6 +368,7 @@ class ProxyService:
             messages=request.messages,
             prompt=request.prompt,
             images=request.images,
+            format=request.format,
             system=request.system,
             stream=request.stream,
             think=request.think,
@@ -379,6 +384,7 @@ class ProxyService:
         messages: list[ChatMessage] | None,
         prompt: str | None,
         images: list[str] | None,
+        format: Any | None,
         system: str | None,
         stream: bool | None,
         think: bool | str | None,
@@ -440,6 +446,7 @@ class ProxyService:
             stream=stream,
             tools=tools,
             tool_choice=tool_choice,
+            response_format=format,
             reasoning=reasoning,
             reasoning_effort=reasoning_effort,
         )
@@ -447,6 +454,52 @@ class ProxyService:
 
 def normalize_ollama_model(model: str) -> str:
     return model[:-7] if model.endswith(":latest") else model
+
+
+def build_responses_text_config(response_format: Any) -> Any:
+    if response_format is None:
+        return None
+
+    if isinstance(response_format, str):
+        if response_format.strip().lower() == "json":
+            return {"format": {"type": "json_object"}}
+        return None
+
+    if not isinstance(response_format, dict):
+        return None
+
+    format_type = response_format.get("type")
+    if format_type == "json_object":
+        return {"format": {"type": "json_object"}}
+
+    if format_type == "json_schema":
+        json_schema = response_format.get("json_schema")
+        if not isinstance(json_schema, dict):
+            return None
+
+        schema = json_schema.get("schema")
+        if not isinstance(schema, dict):
+            return None
+
+        format_payload: dict[str, Any] = {
+            "type": "json_schema",
+            "name": json_schema.get("name") if isinstance(json_schema.get("name"), str) else "response",
+            "schema": schema,
+        }
+        if "strict" in json_schema:
+            format_payload["strict"] = json_schema["strict"]
+        if isinstance(json_schema.get("description"), str):
+            format_payload["description"] = json_schema["description"]
+        return {"format": format_payload}
+
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": "response",
+            "schema": response_format,
+            "strict": True,
+        }
+    }
 
 
 def has_non_system_message(messages: list[ChatMessage]) -> bool:

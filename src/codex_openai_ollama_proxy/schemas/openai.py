@@ -42,6 +42,10 @@ class ChatCompletionsRequest(BaseModel):
     stream: bool | None = None
     tools: list[Any] | None = None
     tool_choice: Any | None = None
+    response_format: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices("response_format", "responseFormat"),
+    )
     reasoning: Any | None = None
     reasoning_effort: str | None = Field(
         default=None,

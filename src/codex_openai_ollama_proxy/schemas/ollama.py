@@ -30,6 +30,7 @@ class OllamaChatRequest(BaseModel):
     messages: list[ChatMessage] | None = None
     prompt: str | None = None
     images: list[str] | None = None
+    format: Any | None = None
     system: str | None = None
     stream: bool | None = None
     think: bool | str | None = None
@@ -48,6 +49,7 @@ class OllamaGenerateRequest(BaseModel):
     model: str
     prompt: str | None = None
     images: list[str] | None = None
+    format: Any | None = None
     system: str | None = None
     stream: bool | None = None
     messages: list[ChatMessage] | None = None

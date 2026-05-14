@@ -934,6 +934,72 @@ def test_ollama_chat_translates_message_images_field_into_backend_input_images(
     ]
 
 
+def test_ollama_chat_json_mode_maps_to_backend_text_format(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_sse_body())
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-5.4",
+                    "stream": False,
+                    "format": "json",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["text"] == {"format": {"type": "json_object"}}
+
+
+def test_ollama_generate_schema_format_maps_to_backend_json_schema(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_sse_body())
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/generate",
+                json={
+                    "model": "gpt-5.4",
+                    "prompt": "hello",
+                    "stream": False,
+                    "format": schema,
+                },
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "response",
+            "schema": schema,
+            "strict": True,
+        }
+    }
+
+
 def test_ollama_streaming_validation_error_maps_to_ndjson_error(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})

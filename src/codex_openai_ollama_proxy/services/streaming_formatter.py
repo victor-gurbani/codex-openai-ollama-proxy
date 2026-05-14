@@ -146,6 +146,32 @@ class OpenAIStreamFormatter:
         }
         return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
+    def tool_calls_chunk(self, tool_calls: list[ChatToolCall]) -> str:
+        payload = {
+            "id": self.chunk_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                **tool_call.model_dump(by_alias=True),
+                            }
+                            for index, tool_call in enumerate(tool_calls)
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
     def final_chunk(self, finish_reason: str, usage: Usage | None) -> str:
         payload = {
             "id": self.chunk_id,

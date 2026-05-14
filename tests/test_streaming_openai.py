@@ -65,7 +65,7 @@ def test_openai_streaming_preserves_chunk_order(tmp_path: Path) -> None:
     assert "data: [DONE]" in body
 
 
-def test_openai_streaming_emits_tool_call_deltas_before_done(tmp_path: Path) -> None:
+def test_openai_streaming_emits_tool_call_snapshot_before_done(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
     settings = build_settings(auth_path)
@@ -101,14 +101,14 @@ def test_openai_streaming_emits_tool_call_deltas_before_done(tmp_path: Path) -> 
                         }
                     ],
                 },
-            )
+    )
 
     assert response.status_code == 200
     body = response.text
-    assert body.find('"role":"assistant","content":"","tool_calls":[{"index":0,"function":{"name":"list_files","arguments":""},"id":"call_1","type":"function"}]') != -1
-    assert body.find('"role":"assistant","content":"","tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\""}}]') != -1
-    assert body.find('"role":"assistant","content":"","tool_calls":[{"index":0,"function":{"arguments":":\\".\\"}"}}]') != -1
-    assert body.find('"finish_reason":"tool_calls"') > body.find('"tool_calls"')
+    tool_chunk = '"role":"assistant","content":"","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"list_files","arguments":"{\\"path\\":\\".\\"}"}}]'
+    assert body.find(tool_chunk) != -1
+    assert body.count('"tool_calls":[') == 1
+    assert body.find('"finish_reason":"tool_calls"') > body.find(tool_chunk)
     assert "data: [DONE]" in body
 
 

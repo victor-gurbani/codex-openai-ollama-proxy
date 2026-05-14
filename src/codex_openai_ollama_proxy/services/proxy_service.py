@@ -116,6 +116,7 @@ class ProxyService:
 
         async def iterator() -> AsyncIterator[str]:
             disconnected = False
+            last_tool_call_signature: str | None = None
             if is_disconnected is not None and await is_disconnected():
                 return
             lines = await self._backend_client.stream_responses_request(responses_req)
@@ -151,8 +152,19 @@ class ProxyService:
                     yield formatter.reasoning_chunk(event.text)
                 elif isinstance(event, ThinkingDoneEvent) and emit:
                     yield formatter.reasoning_chunk(event.text)
-                elif isinstance(event, ToolCallChunkEvent) and emit:
-                    yield formatter.tool_call_chunk(event)
+                elif (
+                    isinstance(event, ToolCallChunkEvent)
+                    and event.is_final
+                    and state.tool_calls
+                ):
+                    tool_call_signature = json.dumps(
+                        [tool.model_dump(by_alias=True) for tool in state.tool_calls],
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    if tool_call_signature != last_tool_call_signature:
+                        yield formatter.tool_calls_chunk(state.tool_calls)
+                        last_tool_call_signature = tool_call_signature
 
             if disconnected:
                 return

@@ -143,6 +143,15 @@ class ProxyService:
             buffered_content: list[str] = []
             emitted_reasoning = False
             saw_tool_calls = False
+
+            async def flush_buffered_content_as_content() -> AsyncIterator[str]:
+                nonlocal buffered_content
+                if not buffered_content:
+                    return
+                for text in buffered_content:
+                    yield formatter.content_chunk(text)
+                buffered_content = []
+
             if is_disconnected is not None and await is_disconnected():
                 return
             lines = await self._backend_client.stream_responses_request(responses_req)
@@ -153,12 +162,16 @@ class ProxyService:
                 if event is HEARTBEAT_SENTINEL:
                     if is_disconnected is not None and await is_disconnected():
                         disconnected = True
+                        async for chunk in flush_buffered_content_as_content():
+                            yield chunk
                         await maybe_aclose_async_iterator(lines)
                         break
                     yield formatter.heartbeat_chunk()
                     continue
                 if is_disconnected is not None and await is_disconnected():
                     disconnected = True
+                    async for chunk in flush_buffered_content_as_content():
+                        yield chunk
                     await maybe_aclose_async_iterator(lines)
                     break
                 if isinstance(event, ErrorEvent):

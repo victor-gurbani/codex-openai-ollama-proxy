@@ -124,7 +124,11 @@ class OpenAIStreamFormatter:
             "choices": [
                 {
                     "index": 0,
-                    "delta": {"role": "assistant", "content": "", "reasoning": text},
+                    "delta": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_text": text,
+                    },
                     "finish_reason": None,
                 }
             ],
@@ -140,10 +144,11 @@ class OpenAIStreamFormatter:
                 event.arguments_delta if event.arguments_delta else event.arguments
             )
 
-        tool_call_payload: dict[str, object] = {"index": event.index, "function": function_payload}
+        tool_call_payload: dict[str, object] = {"index": event.index}
         if event.name is not None:
             tool_call_payload["id"] = event.tool_call_id
             tool_call_payload["type"] = "function"
+        tool_call_payload["function"] = function_payload
 
         payload = {
             "id": self.chunk_id,

@@ -74,7 +74,7 @@ CODEX_AUTH_PATH=~/.codex/auth.json
 API_KEY=ENTER_YOUR_DESIRED_API_KEY_HERE
 DEBUG=false
 DISABLE_COPILOT_ADAPTATIONS=true
-ADD_DEFAULT_RESPONSES_INSTRUCTIONS=false
+ADD_DEFAULT_RESPONSES_INSTRUCTIONS=true
 ```
 
 **Important: `API_KEY` here is not an OpenAI API key. It is simply a password-like token that you choose yourself to protect access to this proxy's incoming endpoints. You might not need to set `API_KEY` if you only use this locally.**
@@ -91,7 +91,7 @@ If you set `DEBUG=true`, the proxy writes request/response trace logs for the ba
 
 `DISABLE_COPILOT_ADAPTATIONS=true` is the default. With that setting, Copilot-looking `/v1/responses` streams are returned as raw backend passthrough instead of applying the small compatibility repairs for tool-call event shape, missing `output_index`, missing function-call ids, or missing function-call status. Set it to `false` only if you need those compatibility repairs.
 
-`ADD_DEFAULT_RESPONSES_INSTRUCTIONS=false` is the default. Set it to `true` only if you want `/v1/responses` requests without explicit `instructions` to receive the proxy's generic default instructions before forwarding to the Codex backend.
+`ADD_DEFAULT_RESPONSES_INSTRUCTIONS=true` is the default. With that setting, `/v1/responses` requests without explicit `instructions` receive the proxy's generic default instructions before forwarding to the Codex backend. Set it to `false` only if you need strict no-instruction passthrough for requests that omit `instructions`.
 
 Rules:
 

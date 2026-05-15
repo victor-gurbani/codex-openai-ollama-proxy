@@ -9,8 +9,31 @@ declare -a pass_args=("$@")
 LOG_FILE="$SCRIPT_DIR/logs/proxy.stdout.log"
 PID_FILE="$SCRIPT_DIR/proxy.pid"
 
+print_env_flag_status() {
+  local name="$1"
+  local value="${!name-}"
+  local normalized
+  normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ -z "$value" ]]; then
+    echo "$name: not set in shell; run-proxy/Python may load it from .env/defaults"
+    return
+  fi
+
+  case "$normalized" in
+    1|true|yes|on)
+      echo "$name: on in shell; passed to run-proxy/Python"
+      ;;
+    *)
+      echo "$name: off in shell ('$value'); passed to run-proxy/Python"
+      ;;
+  esac
+}
+
 echo "Restarting codex-openai-ollama-proxy"
 echo "Working directory: $PWD"
+print_env_flag_status "DEBUG"
+print_env_flag_status "DISABLE_COPILOT_ADAPTATIONS"
 echo
 
 "$SCRIPT_DIR/stop-proxy.sh" "${pass_args[@]}"

@@ -21,9 +21,32 @@ if [[ ! -d ".venv" ]]; then
   exit 1
 fi
 
+print_env_flag_status() {
+  local name="$1"
+  local value="${!name-}"
+  local normalized
+  normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ -z "$value" ]]; then
+    echo "$name: not set in shell; Python may load it from .env/defaults"
+    return
+  fi
+
+  case "$normalized" in
+    1|true|yes|on)
+      echo "$name: on in shell; passed to Python"
+      ;;
+    *)
+      echo "$name: off in shell ('$value'); passed to Python"
+      ;;
+  esac
+}
+
 echo "Starting codex-openai-ollama-proxy"
 echo "Working directory: $PWD"
 echo "Config sources: CLI args > environment variables > .env > built-in defaults"
+print_env_flag_status "DEBUG"
+print_env_flag_status "DISABLE_COPILOT_ADAPTATIONS"
 echo
 
 if (( ${#pass_args[@]} )); then

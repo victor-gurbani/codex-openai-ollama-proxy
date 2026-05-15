@@ -618,3 +618,71 @@ def test_openai_streaming_reasoning_summary_part_added_does_not_duplicate_done(
     assert body.count('"role":"assistant","content":"","reasoning_text":"Plan"') == 1
     assert '"role":"assistant","content":"OK"' in body
     assert "data: [DONE]" in body
+
+
+def test_openai_streaming_reclassifies_post_tool_planning_text_as_reasoning(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    planning_text = (
+        "I'm checking the workspace contents and verifying command outputs so I can "
+        "give you a complete file list before the final report."
+    )
+    backend_body = (
+        'data: {"type":"response.output_text.done","text":"'
+        + planning_text
+        + '","item_id":"msg_1","output_index":0}\n\n'
+        'data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","status":"completed","content":[{"type":"output_text","text":"'
+        + planning_text
+        + '"}]},"output_index":0}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Available tools in this environment:"}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-5.4",
+                    "stream": True,
+                    "messages": [
+                        {"role": "user", "content": "list files"},
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "run_in_terminal",
+                                        "arguments": {"command": "ls"},
+                                    },
+                                }
+                            ],
+                        },
+                        {"role": "tool", "tool_call_id": "call_1", "content": "files"},
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "run_in_terminal", "parameters": {"type": "object"}},
+                        }
+                    ],
+                },
+            )
+
+    assert response.status_code == 200
+    body = response.text
+    assert body.count('"reasoning_text":"' + planning_text) == 1
+    assert '"content":"' + planning_text not in body
+    assert '"content":"Available tools in this environment:"' in body

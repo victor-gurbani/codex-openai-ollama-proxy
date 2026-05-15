@@ -88,6 +88,43 @@ PSEUDO_TOOL_LEAK_MARKERS = (
 )
 MAX_PSEUDO_TOOL_LEAK_MARKER_LENGTH = max(len(marker) for marker in PSEUDO_TOOL_LEAK_MARKERS)
 MIN_PSEUDO_TOOL_LEAK_MARKER_PREFIX_LENGTH = 3
+AGENTIC_PLANNING_STARTS = (
+    "i'm ",
+    "i’m ",
+    "i am ",
+    "i'll ",
+    "i’ll ",
+    "i will ",
+)
+AGENTIC_PLANNING_ACTIONS = (
+    "check",
+    "checking",
+    "confirm",
+    "confirming",
+    "gather",
+    "gathering",
+    "inspect",
+    "inspecting",
+    "enumerate",
+    "enumerating",
+    "verify",
+    "verifying",
+    "run",
+    "running",
+    "execute",
+    "executing",
+    "collect",
+    "collecting",
+)
+AGENTIC_PLANNING_PURPOSE_MARKERS = (
+    " so i can ",
+    " so we can ",
+    " then i",
+    " before the final ",
+    " next i",
+    " outcome:",
+    " why:",
+)
 
 
 def normalize_tool_turn_reasoning(
@@ -107,6 +144,15 @@ def strip_pseudo_tool_markup(text: str) -> str:
         if index != -1 and (earliest_index is None or index < earliest_index):
             earliest_index = index
     return text[:earliest_index].rstrip() if earliest_index is not None else text
+
+
+def looks_like_agentic_planning_text(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized.startswith(AGENTIC_PLANNING_STARTS):
+        return False
+    if not any(action in normalized[:80] for action in AGENTIC_PLANNING_ACTIONS):
+        return False
+    return any(marker in normalized for marker in AGENTIC_PLANNING_PURPOSE_MARKERS)
 
 
 class StreamTextLeakFilter:
@@ -219,6 +265,9 @@ class ProxyService:
         formatter = OpenAIStreamFormatter(requested_model)
         state = StreamState()
         include_usage = should_include_stream_usage(chat_req)
+        should_reclassify_planning_text = bool(chat_req.tools) or any(
+            message.role == "tool" for message in chat_req.messages
+        )
 
         async def iterator() -> AsyncIterator[str]:
             disconnected = False
@@ -237,6 +286,46 @@ class ProxyService:
                     cleaned = content_leak_filter.sanitize(text)
                     if cleaned:
                         yield formatter.content_chunk(cleaned)
+                buffered_content = []
+
+            async def flush_buffered_content_at_end() -> AsyncIterator[str]:
+                nonlocal buffered_content, emitted_reasoning
+                if not buffered_content:
+                    return
+                for text in buffered_content:
+                    if (
+                        should_reclassify_planning_text
+                        and not emitted_reasoning
+                        and looks_like_agentic_planning_text(text)
+                    ):
+                        cleaned = reasoning_leak_filter.sanitize(text)
+                        if cleaned:
+                            yield formatter.reasoning_chunk(cleaned)
+                        flushed_reasoning = reasoning_leak_filter.flush()
+                        if flushed_reasoning:
+                            yield formatter.reasoning_chunk(flushed_reasoning)
+                        emitted_reasoning = True
+                        continue
+
+                    chunk_writer = (
+                        formatter.reasoning_chunk
+                        if saw_tool_calls and not emitted_reasoning
+                        else formatter.content_chunk
+                    )
+                    leak_filter = (
+                        reasoning_leak_filter
+                        if chunk_writer is formatter.reasoning_chunk
+                        else content_leak_filter
+                    )
+                    cleaned = leak_filter.sanitize(text)
+                    if cleaned:
+                        yield chunk_writer(cleaned)
+                flushed_content = content_leak_filter.flush()
+                if flushed_content:
+                    yield formatter.content_chunk(flushed_content)
+                flushed_reasoning = reasoning_leak_filter.flush()
+                if flushed_reasoning:
+                    yield formatter.reasoning_chunk(flushed_reasoning)
                 buffered_content = []
 
             if is_disconnected is not None and await is_disconnected():
@@ -344,16 +433,8 @@ class ProxyService:
                     "Empty content and no tool calls returned from ChatGPT backend"
                 )
 
-            if buffered_content:
-                chunk_writer = formatter.reasoning_chunk if saw_tool_calls and not emitted_reasoning else formatter.content_chunk
-                for text in buffered_content:
-                    leak_filter = reasoning_leak_filter if chunk_writer is formatter.reasoning_chunk else content_leak_filter
-                    cleaned = leak_filter.sanitize(text)
-                    if cleaned:
-                        yield chunk_writer(cleaned)
-                flushed = leak_filter.flush()
-                if flushed:
-                    yield chunk_writer(flushed)
+            async for chunk in flush_buffered_content_at_end():
+                yield chunk
 
             flushed_content = content_leak_filter.flush()
             if flushed_content:

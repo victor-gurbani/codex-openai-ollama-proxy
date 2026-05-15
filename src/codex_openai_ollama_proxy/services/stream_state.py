@@ -38,7 +38,9 @@ class StreamState:
     thinking: str = ""
     usage: Usage | None = None
     saw_text_delta: bool = False
+    saw_text_done: bool = False
     saw_thinking_delta: bool = False
+    saw_thinking_done: bool = False
     _tool_calls_by_item: dict[str, ToolCallSnapshot] = field(default_factory=dict)
 
     def apply(self, event: StreamEvent) -> bool:
@@ -50,7 +52,10 @@ class StreamState:
         if isinstance(event, TextDoneEvent):
             if self.saw_text_delta:
                 return False
+            if self.saw_text_done and self.text.endswith(event.text):
+                return False
             self.text += event.text
+            self.saw_text_done = True
             return True
 
         if isinstance(event, ThinkingDeltaEvent):
@@ -61,7 +66,10 @@ class StreamState:
         if isinstance(event, ThinkingDoneEvent):
             if self.saw_thinking_delta:
                 return False
+            if self.saw_thinking_done and self.thinking.endswith(event.text):
+                return False
             self.thinking += event.text
+            self.saw_thinking_done = True
             return True
 
         if isinstance(event, ToolCallChunkEvent):

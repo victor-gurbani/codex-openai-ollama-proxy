@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from httpx import Response
 
 from codex_openai_ollama_proxy.app import create_app
-from codex_openai_ollama_proxy.core.config import Settings
+from codex_openai_ollama_proxy.core.config import DEFAULT_SYSTEM_INSTRUCTIONS, Settings
 
 
 def write_auth_file(path: Path, payload: dict) -> None:
@@ -20,7 +20,7 @@ def build_settings(
     *,
     debug: bool = False,
     disable_copilot_adaptations: bool = True,
-    add_default_responses_instructions: bool = False,
+    add_default_responses_instructions: bool = True,
     project_root: Path | None = None,
 ) -> Settings:
     return Settings(
@@ -140,6 +140,7 @@ def test_openai_responses_passthrough_route_preserves_json_body_and_headers(
         "model": "gpt-5.4",
         "input": "hello",
         "reasoning": {"effort": "high"},
+        "instructions": DEFAULT_SYSTEM_INSTRUCTIONS,
     }
     assert route.calls.last.request.headers["authorization"] == "Bearer backend_key"
     assert route.calls.last.request.headers["accept"] == "application/json"
@@ -176,10 +177,11 @@ def test_openai_responses_passthrough_defaults_missing_reasoning_to_xhigh(
         "model": "gpt-5.4",
         "input": "hello",
         "reasoning": {"effort": "xhigh"},
+        "instructions": DEFAULT_SYSTEM_INSTRUCTIONS,
     }
 
 
-def test_openai_responses_passthrough_does_not_add_default_instructions_by_default(
+def test_openai_responses_passthrough_adds_default_instructions_by_default(
     tmp_path: Path,
 ) -> None:
     auth_path = tmp_path / "auth.json"
@@ -204,15 +206,15 @@ def test_openai_responses_passthrough_does_not_add_default_instructions_by_defau
 
     assert response.status_code == 200
     forwarded_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
-    assert "instructions" not in forwarded_payload
+    assert forwarded_payload["instructions"] == DEFAULT_SYSTEM_INSTRUCTIONS
 
 
-def test_openai_responses_passthrough_adds_default_instructions_when_enabled(
+def test_openai_responses_passthrough_omits_default_instructions_when_disabled(
     tmp_path: Path,
 ) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
-    settings = build_settings(auth_path, add_default_responses_instructions=True)
+    settings = build_settings(auth_path, add_default_responses_instructions=False)
     app = create_app(settings)
 
     with respx.mock(assert_all_called=True) as respx_mock:
@@ -232,10 +234,7 @@ def test_openai_responses_passthrough_adds_default_instructions_when_enabled(
 
     assert response.status_code == 200
     forwarded_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
-    assert forwarded_payload["instructions"] == (
-        "You are a helpful AI assistant. Provide clear, accurate, and concise responses "
-        "to user questions and requests."
-    )
+    assert "instructions" not in forwarded_payload
 
 
 def test_openai_responses_passthrough_defaults_empty_reasoning_effort_to_xhigh(
@@ -266,6 +265,7 @@ def test_openai_responses_passthrough_defaults_empty_reasoning_effort_to_xhigh(
         "model": "gpt-5.4",
         "input": "hello",
         "reasoning": {"summary": "auto", "effort": "xhigh"},
+        "instructions": DEFAULT_SYSTEM_INSTRUCTIONS,
     }
 
 
@@ -391,6 +391,7 @@ def test_openai_responses_passthrough_route_preserves_sse_stream(tmp_path: Path)
         "input": "hello",
         "stream": True,
         "reasoning": {"effort": "high"},
+        "instructions": DEFAULT_SYSTEM_INSTRUCTIONS,
     }
 
 
@@ -840,6 +841,7 @@ def test_openai_responses_passthrough_strips_backend_unsupported_generation_fiel
         "input": [{"role": "user", "content": "hello"}],
         "stream": True,
         "reasoning": {"effort": "xhigh"},
+        "instructions": DEFAULT_SYSTEM_INSTRUCTIONS,
     }
 
 

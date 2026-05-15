@@ -96,7 +96,7 @@ class Settings:
     service_version: str = "0.1.0"
     ollama_compat_version: str = DEFAULT_OLLAMA_COMPAT_VERSION
     disable_copilot_adaptations: bool = True
-    add_default_responses_instructions: bool = False
+    add_default_responses_instructions: bool = True
     public_paths: frozenset[str] = field(
         default_factory=lambda: frozenset(
             {
@@ -157,8 +157,9 @@ class Settings:
             os.getenv("DISABLE_COPILOT_ADAPTATIONS"),
             True,
         )
-        add_default_responses_instructions = normalize_bool(
-            os.getenv("ADD_DEFAULT_RESPONSES_INSTRUCTIONS")
+        add_default_responses_instructions = normalize_bool_default(
+            os.getenv("ADD_DEFAULT_RESPONSES_INSTRUCTIONS"),
+            True,
         )
 
         return cls(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .openai import ChatMessage
 
@@ -23,6 +23,19 @@ def validate_ollama_think(value: Any) -> bool | str | None:
         if normalized in {"none", "low", "medium", "high", "xhigh"}:
             return normalized
     raise ValueError("think must be one of: true, false, none, low, medium, high, xhigh")
+
+
+def prefer_legacy_name_when_model_is_blank(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return data
+
+    model = data.get("model")
+    name = data.get("name")
+    if isinstance(name, str) and name.strip() and not (
+        isinstance(model, str) and model.strip()
+    ):
+        return {**data, "model": name}
+    return data
 
 
 class OllamaChatRequest(BaseModel):
@@ -67,3 +80,20 @@ class OllamaShowRequest(BaseModel):
     model: str = Field(validation_alias=AliasChoices("model", "name"))
 
     model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _prefer_legacy_name_when_model_is_blank(cls, data: Any) -> Any:
+        return prefer_legacy_name_when_model_is_blank(data)
+
+
+class OllamaPullRequest(BaseModel):
+    model: str = Field(validation_alias=AliasChoices("model", "name"))
+    stream: bool | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _prefer_legacy_name_when_model_is_blank(cls, data: Any) -> Any:
+        return prefer_legacy_name_when_model_is_blank(data)

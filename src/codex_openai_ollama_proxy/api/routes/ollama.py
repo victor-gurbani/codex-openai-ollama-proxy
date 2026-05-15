@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -16,6 +17,7 @@ from codex_openai_ollama_proxy.core.errors import BackendSSEError, ollama_error_
 from codex_openai_ollama_proxy.schemas.ollama import (
     OllamaChatRequest,
     OllamaGenerateRequest,
+    OllamaPullRequest,
     OllamaShowRequest,
 )
 from codex_openai_ollama_proxy.services.model_catalog import ModelCatalogService
@@ -26,6 +28,8 @@ from codex_openai_ollama_proxy.services.tool_conversion import convert_chat_tool
 router = APIRouter(tags=["ollama"])
 
 SHOW_CAPABILITIES = ["completion", "tools", "thinking"]
+SYNTHETIC_MODEL_MODIFIED_AT = "2000-01-01T00:00:00Z"
+SYNTHETIC_MODEL_SIZE_BYTES = 1
 
 
 def normalize_family_name(value: str) -> str:
@@ -103,6 +107,13 @@ def metadata_supports_image_input(metadata: dict[str, object] | None) -> bool:
     return False
 
 
+def ollama_model_capabilities(metadata: dict[str, object] | None = None) -> list[str]:
+    capabilities = list(SHOW_CAPABILITIES)
+    if metadata_supports_image_input(metadata):
+        capabilities.append("vision")
+    return capabilities
+
+
 def add_namespaced_metadata(
     model_info: dict[str, object], metadata: dict[str, object] | None
 ) -> None:
@@ -145,6 +156,10 @@ def ollama_model_details(
     }
 
 
+def synthetic_model_digest(model: str) -> str:
+    return sha256(f"codex-openai-ollama-proxy:{model}".encode("utf-8")).hexdigest()
+
+
 def ollama_show_payload(
     model: str, metadata: dict[str, object] | None = None
 ) -> dict[str, object]:
@@ -166,9 +181,6 @@ def ollama_show_payload(
         parameters = f"num_ctx {context_length}"
     add_namespaced_metadata(model_info, metadata)
 
-    capabilities = list(SHOW_CAPABILITIES)
-    if metadata_supports_image_input(metadata):
-        capabilities.append("vision")
     return {
         "license": "",
         "modelfile": f"FROM {model}\n",
@@ -176,8 +188,8 @@ def ollama_show_payload(
         "template": "",
         "details": details,
         "model_info": model_info,
-        "capabilities": capabilities,
-        "modified_at": "1970-01-01T00:00:00.000Z",
+        "capabilities": ollama_model_capabilities(metadata),
+        "modified_at": SYNTHETIC_MODEL_MODIFIED_AT,
         "requires": "0.17.1",
         "tensors": [],
     }
@@ -189,6 +201,56 @@ def ollama_not_found_response(model: str) -> JSONResponse:
         headers={"Access-Control-Allow-Origin": "*"},
         content={"error": f"model '{model}' not found"},
     )
+
+
+def has_ollama_prompt_or_messages(
+    prompt: str | None,
+    messages: list[object] | None,
+) -> bool:
+    if prompt and prompt.strip():
+        return True
+    if not messages:
+        return False
+    for message in messages:
+        role = getattr(message, "role", "")
+        if isinstance(role, str) and role.lower() == "system":
+            continue
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            return True
+        if isinstance(content, list) and content:
+            return True
+        if content is not None and not isinstance(content, str | list):
+            return True
+    return False
+
+
+def ollama_load_payload(model: str, *, mode: str) -> dict[str, object]:
+    created_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    payload: dict[str, object] = {
+        "model": model,
+        "created_at": created_at,
+        "done": True,
+    }
+    if mode == "chat":
+        payload["message"] = {"role": "assistant", "content": ""}
+    else:
+        payload["response"] = ""
+        payload["context"] = []
+    return payload
+
+
+def ollama_load_response(model: str, *, mode: str, stream: bool | None):
+    payload = ollama_load_payload(model, mode=mode)
+    if stream is False:
+        return JSONResponse(content=payload)
+
+    async def stream_load():
+        import json
+
+        yield json.dumps(payload, separators=(",", ":")) + "\n"
+
+    return StreamingResponse(stream_load(), media_type="application/x-ndjson")
 
 
 def format_proxy_expires_at(ttl_seconds: float) -> str:
@@ -215,8 +277,8 @@ def ollama_ps_model_payload(
     payload: dict[str, object] = {
         "name": model,
         "model": model,
-        "size": 0,
-        "digest": "",
+        "size": SYNTHETIC_MODEL_SIZE_BYTES,
+        "digest": synthetic_model_digest(model),
         "details": ollama_model_details(model),
         "expires_at": expires_at,
         "size_vram": metadata_size_vram(metadata),
@@ -233,19 +295,21 @@ async def ollama_tags(
     model_catalog: ModelCatalogService = Depends(get_model_catalog),
 ) -> dict[str, object]:
     models = await model_catalog.get_exposed_models()
-    return {
-        "models": [
+    payload_models: list[dict[str, object]] = []
+    for model in models:
+        metadata = await model_catalog.get_model_metadata_for_request(model)
+        payload_models.append(
             {
                 "name": model,
                 "model": model,
-                "modified_at": "1970-01-01T00:00:00.000Z",
-                "size": 0,
-                "digest": "",
-                "details": ollama_model_details(model),
+                "modified_at": SYNTHETIC_MODEL_MODIFIED_AT,
+                "size": SYNTHETIC_MODEL_SIZE_BYTES,
+                "digest": synthetic_model_digest(model),
+                "details": ollama_model_details(model, metadata),
+                "capabilities": ollama_model_capabilities(metadata),
             }
-            for model in models
-        ]
-    }
+        )
+    return {"models": payload_models}
 
 
 @router.get("/api/ps")
@@ -277,6 +341,25 @@ async def ollama_show(
     return JSONResponse(content=ollama_show_payload(normalized_model, metadata))
 
 
+@router.post("/api/pull")
+async def ollama_pull(
+    request: OllamaPullRequest,
+    model_catalog: ModelCatalogService = Depends(get_model_catalog),
+):
+    normalized_model = normalize_ollama_model(request.model)
+    exposed_models = await model_catalog.get_exposed_models()
+    if normalized_model not in exposed_models:
+        return ollama_not_found_response(normalized_model)
+
+    if request.stream is False:
+        return JSONResponse(content={"status": "success"})
+
+    async def stream_success():
+        yield '{"status":"success"}\n'
+
+    return StreamingResponse(stream_success(), media_type="application/x-ndjson")
+
+
 @router.post("/api/chat")
 async def ollama_chat(
     request: OllamaChatRequest,
@@ -288,6 +371,9 @@ async def ollama_chat(
     exposed_models = await model_catalog.get_exposed_models()
     if normalized_model not in exposed_models:
         return ollama_not_found_response(normalized_model)
+
+    if not has_ollama_prompt_or_messages(request.prompt, request.messages):
+        return ollama_load_response(normalized_model, mode="chat", stream=request.stream)
 
     debug_tokens = start_debug_request(
         raw_request.url.path,
@@ -380,6 +466,9 @@ async def ollama_generate(
     exposed_models = await model_catalog.get_exposed_models()
     if normalized_model not in exposed_models:
         return ollama_not_found_response(normalized_model)
+
+    if not has_ollama_prompt_or_messages(request.prompt, request.messages):
+        return ollama_load_response(normalized_model, mode="generate", stream=request.stream)
 
     debug_tokens = start_debug_request(
         raw_request.url.path,

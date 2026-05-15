@@ -7,7 +7,11 @@ import respx
 from fastapi.testclient import TestClient
 from httpx import Response
 
-from codex_openai_ollama_proxy.api.routes.ollama import ollama_model_details
+from codex_openai_ollama_proxy.api.routes.ollama import (
+    SYNTHETIC_MODEL_MODIFIED_AT,
+    SYNTHETIC_MODEL_SIZE_BYTES,
+    ollama_model_details,
+)
 from codex_openai_ollama_proxy.app import create_app
 from codex_openai_ollama_proxy.core.config import Settings
 
@@ -56,6 +60,33 @@ def test_api_version_returns_ollama_compat_semver(tmp_path: Path) -> None:
     assert response.json() == {"version": "0.22.0"}
 
 
+def test_ollama_root_get_matches_native_liveness_probe(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.text == "Ollama is running"
+    assert response.headers["content-type"].startswith("text/plain")
+
+
+def test_ollama_root_head_succeeds_for_cli_probe(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.head("/")
+
+    assert response.status_code == 200
+    assert response.text == ""
+
+
 def test_api_version_head_succeeds(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
@@ -98,7 +129,7 @@ def test_ollama_show_known_model_returns_metadata(tmp_path: Path) -> None:
     assert payload["model_info"]["general.file_type"] == 0
     assert "general.context_length" not in payload["model_info"]
     assert payload["capabilities"] == ["completion", "tools", "thinking"]
-    assert payload["modified_at"] == "1970-01-01T00:00:00.000Z"
+    assert payload["modified_at"] == SYNTHETIC_MODEL_MODIFIED_AT
     assert payload["requires"] == "0.17.1"
     assert payload["tensors"] == []
 
@@ -310,6 +341,78 @@ def test_ollama_show_accepts_legacy_name_field(tmp_path: Path) -> None:
     assert response.json()["model_info"]["general.basename"] == "gpt-5.4"
 
 
+def test_ollama_show_prefers_legacy_name_when_model_is_blank(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/api/show", json={"model": "", "name": "gpt-5.4"})
+
+    assert response.status_code == 200
+    assert response.json()["model_info"]["general.basename"] == "gpt-5.4"
+
+
+def test_ollama_pull_known_model_returns_streaming_success(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/api/pull", json={"model": "gpt-5.4"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+    assert response.text == '{"status":"success"}\n'
+
+
+def test_ollama_pull_known_model_can_return_non_streaming_success(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/pull",
+            json={"name": "gpt-5.4:latest", "stream": False},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+
+
+def test_ollama_pull_prefers_legacy_name_when_model_is_blank(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/pull",
+            json={"model": "", "name": "gpt-5.4", "stream": False},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+
+
+def test_ollama_pull_unknown_model_returns_404(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/api/pull", json={"model": "missing-model"})
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "model 'missing-model' not found"}
+
+
 def test_ollama_ps_returns_fallback_models_with_synthetic_runtime_fields(
     tmp_path: Path,
 ) -> None:
@@ -337,8 +440,9 @@ def test_ollama_ps_returns_fallback_models_with_synthetic_runtime_fields(
     ]
     assert first_model["model"] == first_model["name"]
     assert first_model["details"]["format"] == "proxy"
-    assert first_model["size"] == 0
-    assert first_model["digest"] == ""
+    assert first_model["size"] == SYNTHETIC_MODEL_SIZE_BYTES
+    assert isinstance(first_model["digest"], str)
+    assert len(first_model["digest"]) == 64
     assert first_model["size_vram"] == 0
     assert first_model["expires_at"].endswith("Z")
 
@@ -388,6 +492,79 @@ def test_ollama_model_details_normalizes_family_like_real_ollama() -> None:
 
     assert details["family"] == "qwen35"
     assert details["families"] == ["qwen35"]
+
+
+def test_api_tags_returns_ollama_cli_safe_model_metadata(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.get("/api/tags")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert sorted(payload.keys()) == ["models"]
+    first_model = payload["models"][0]
+    assert sorted(first_model.keys()) == [
+        "capabilities",
+        "details",
+        "digest",
+        "model",
+        "modified_at",
+        "name",
+        "size",
+    ]
+    assert first_model["name"] == first_model["model"]
+    assert first_model["modified_at"] == SYNTHETIC_MODEL_MODIFIED_AT
+    assert first_model["size"] == SYNTHETIC_MODEL_SIZE_BYTES
+    assert isinstance(first_model["digest"], str)
+    assert len(first_model["digest"]) == 64
+    assert first_model["details"]["format"] == "proxy"
+    assert first_model["capabilities"] == ["completion", "tools", "thinking"]
+
+
+def test_api_tags_advertises_vision_when_backend_metadata_supports_images(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    catalog_body = {
+        "models": [
+            {
+                "slug": "gpt-5.4",
+                "display_name": "GPT-5.4",
+                "input_modalities": ["text", "image"],
+            }
+        ]
+    }
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get(settings.backend_models_url).mock(
+            return_value=Response(200, json=catalog_body)
+        )
+        with TestClient(app) as client:
+            response = client.get("/api/tags")
+
+    assert response.status_code == 200
+    payload = response.json()
+    models = {item["model"]: item for item in payload["models"]}
+    assert models["gpt-5.4"]["capabilities"] == [
+        "completion",
+        "tools",
+        "thinking",
+        "vision",
+    ]
+    assert models["gpt-5.4-low"]["capabilities"] == [
+        "completion",
+        "tools",
+        "thinking",
+        "vision",
+    ]
 
 
 def test_ollama_show_uses_codex_family_key_for_codex_models(tmp_path: Path) -> None:
@@ -492,12 +669,14 @@ def test_ollama_chat_route_forwards_tools_and_returns_tool_calls(tmp_path: Path)
     assert backend_payload["tools"][0]["type"] == "function"
     assert backend_payload["tools"][0]["name"] == "list_files"
     assert payload["message"]["content"] == ""
-    assert payload["message"]["tool_calls"][0]["type"] == "function"
     assert payload["message"]["tool_calls"][0]["function"]["name"] == "list_files"
     assert payload["message"]["tool_calls"][0]["function"]["arguments"] == {
         "path": ".",
         "recursive": False,
     }
+    assert "type" not in payload["message"]["tool_calls"][0]
+    assert payload["message"]["tool_calls"][0]["id"] == "call_1"
+    assert payload["message"]["tool_calls"][0]["function"]["index"] == 0
 
 
 def test_ollama_chat_think_false_maps_to_none_reasoning(tmp_path: Path) -> None:
@@ -813,7 +992,7 @@ def test_ollama_generate_streams_by_default_when_stream_is_omitted(tmp_path: Pat
     assert '"done":true' in response.text
 
 
-def test_ollama_non_streaming_validation_error_maps_to_ollama_error(tmp_path: Path) -> None:
+def test_ollama_generate_empty_non_streaming_loads_model(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
     settings = build_settings(auth_path)
@@ -825,8 +1004,29 @@ def test_ollama_non_streaming_validation_error_maps_to_ollama_error(tmp_path: Pa
             json={"model": "gpt-5.4:latest", "stream": False},
         )
 
-    assert response.status_code == 400
-    assert "missing prompt or messages" in response.json()["error"]
+    assert response.status_code == 200
+    assert response.json()["model"] == "gpt-5.4"
+    assert response.json()["response"] == ""
+    assert response.json()["done"] is True
+
+
+def test_ollama_chat_empty_streaming_loads_model(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat",
+            json={"model": "gpt-5.4:latest", "messages": [], "stream": True},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+    assert '"model":"gpt-5.4"' in response.text
+    assert '"message":{"role":"assistant","content":""}' in response.text
+    assert '"done":true' in response.text
 
 
 def test_ollama_chat_unknown_model_returns_native_not_found_error(tmp_path: Path) -> None:
@@ -1000,7 +1200,7 @@ def test_ollama_generate_schema_format_maps_to_backend_json_schema(tmp_path: Pat
     }
 
 
-def test_ollama_streaming_validation_error_maps_to_ndjson_error(tmp_path: Path) -> None:
+def test_ollama_generate_empty_streaming_loads_model(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
     settings = build_settings(auth_path)
@@ -1014,7 +1214,9 @@ def test_ollama_streaming_validation_error_maps_to_ndjson_error(tmp_path: Path) 
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/x-ndjson")
-    assert '"error":"proxy error: missing prompt or messages"' in response.text
+    assert '"model":"gpt-5.4"' in response.text
+    assert '"response":""' in response.text
+    assert '"done":true' in response.text
 
 
 def test_ollama_invalid_think_value_rejected(tmp_path: Path) -> None:

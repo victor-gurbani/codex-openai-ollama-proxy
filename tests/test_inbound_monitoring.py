@@ -108,7 +108,7 @@ def test_inbound_monitor_logs_unauthorized_requests_before_route_handler(
 
     with TestClient(app) as client:
         response = client.get(
-            "/api/version?client=vscode",
+            "/v1/models?client=vscode",
             headers={
                 "Authorization": "Bearer wrong-secret",
                 "Cookie": "session=abc",
@@ -121,7 +121,7 @@ def test_inbound_monitor_logs_unauthorized_requests_before_route_handler(
     inbound_response = next(entry for entry in entries if entry["event"] == "inbound_response")
 
     assert inbound_request["method"] == "GET"
-    assert inbound_request["path"] == "/api/version"
+    assert inbound_request["path"] == "/v1/models"
     assert inbound_request["query"] == {"client": "vscode"}
     assert inbound_request["headers"]["authorization"] == "[REDACTED]"
     assert inbound_request["headers"]["cookie"] == "[REDACTED]"

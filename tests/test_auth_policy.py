@@ -21,7 +21,10 @@ def build_settings(required_api_key: str | None) -> Settings:
 def test_public_paths_remain_open_when_api_key_is_required() -> None:
     client = TestClient(create_app(build_settings("32123")))
 
+    assert client.get("/").status_code == 200
+    assert client.head("/").status_code == 200
     assert client.get("/health").status_code == 200
+    assert client.get("/api/version").status_code == 200
     assert client.get("/api/tags").status_code == 200
     assert client.get("/api/ps").status_code == 200
     assert client.get("/chat-test").status_code == 200
@@ -32,7 +35,6 @@ def test_protected_paths_require_api_key_when_configured() -> None:
     client = TestClient(create_app(build_settings("32123")))
 
     assert client.get("/models").status_code == 401
-    assert client.get("/api/version").status_code == 401
     assert client.post("/api/show", json={"model": "gpt-5.4"}).status_code == 401
 
     authorized = client.get("/models", headers={"Authorization": "Bearer 32123"})

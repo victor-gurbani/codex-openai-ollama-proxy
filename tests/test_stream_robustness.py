@@ -11,6 +11,7 @@ from httpx import Response
 
 from codex_openai_ollama_proxy.app import create_app
 from codex_openai_ollama_proxy.core.config import Settings
+from codex_openai_ollama_proxy.schemas.ollama import OllamaChatRequest, OllamaGenerateRequest
 from codex_openai_ollama_proxy.schemas.openai import ChatCompletionsRequest, ChatMessage
 from codex_openai_ollama_proxy.services.model_catalog import ModelCatalogService
 from codex_openai_ollama_proxy.services.proxy_service import ProxyService
@@ -106,6 +107,34 @@ class SlowFakeBackendClient(FakeBackendClient):
         return iterator()
 
 
+class PausingFakeBackendClient(FakeBackendClient):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.first_answer_delta_sent = asyncio.Event()
+        self.allow_completion = asyncio.Event()
+
+    async def stream_responses_request(self, responses_req):  # noqa: ARG002
+        async def iterator():
+            try:
+                yield (
+                    'data: {"type":"response.reasoning_summary_text.delta",'
+                    '"delta":"Thinking..."}'
+                )
+                self.first_answer_delta_sent.set()
+                yield 'data: {"type":"response.output_text.delta","delta":"Hel"}'
+                await self.allow_completion.wait()
+                yield 'data: {"type":"response.output_text.delta","delta":"lo"}'
+                yield (
+                    'data: {"type":"response.completed","response":{"usage":'
+                    '{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}'
+                )
+                yield "data: [DONE]"
+            finally:
+                self.closed = True
+
+        return iterator()
+
+
 @pytest.mark.asyncio
 async def test_disconnect_stops_stream_and_closes_upstream(tmp_path: Path) -> None:
     settings = build_settings(tmp_path / "auth.json")
@@ -187,8 +216,6 @@ async def test_ollama_stream_emits_idle_heartbeat(tmp_path: Path) -> None:
     )
     model_catalog = ModelCatalogService(settings, backend_client)  # type: ignore[arg-type]
     service = ProxyService(settings, backend_client, model_catalog)  # type: ignore[arg-type]
-    from codex_openai_ollama_proxy.schemas.ollama import OllamaGenerateRequest
-
     request = OllamaGenerateRequest(
         model="gpt-5.4:latest",
         prompt="hello",
@@ -203,3 +230,44 @@ async def test_ollama_stream_emits_idle_heartbeat(tmp_path: Path) -> None:
     assert any('"response":""' in chunk and '"done":false' in chunk for chunk in chunks[:-1])
     assert any('"response":"Hel"' in chunk for chunk in chunks)
     assert '"done":true' in chunks[-1]
+
+
+@pytest.mark.asyncio
+async def test_ollama_chat_stream_emits_answer_before_backend_completion(
+    tmp_path: Path,
+) -> None:
+    settings = build_settings(tmp_path / "auth.json")
+    backend_client = PausingFakeBackendClient()
+    model_catalog = ModelCatalogService(settings, backend_client)  # type: ignore[arg-type]
+    service = ProxyService(settings, backend_client, model_catalog)  # type: ignore[arg-type]
+    request = OllamaChatRequest(
+        model="gpt-5.4:latest",
+        messages=[ChatMessage(role="user", content="hello")],
+        stream=True,
+        think=True,
+    )
+
+    stream = await service.stream_ollama_chat(request)
+    iterator = stream.__aiter__()
+    chunks: list[str] = []
+
+    try:
+        for _ in range(4):
+            chunks.append(await asyncio.wait_for(iterator.__anext__(), timeout=0.1))
+            if any('"content":"Hel"' in chunk for chunk in chunks):
+                break
+
+        assert backend_client.first_answer_delta_sent.is_set()
+        assert not backend_client.allow_completion.is_set()
+        assert any('"thinking":"Thinking..."' in chunk for chunk in chunks)
+        assert any('"content":"Hel"' in chunk for chunk in chunks)
+
+        backend_client.allow_completion.set()
+        async for chunk in iterator:
+            chunks.append(chunk)
+
+        assert any('"content":"lo"' in chunk for chunk in chunks)
+        assert '"done":true' in chunks[-1]
+    finally:
+        backend_client.allow_completion.set()
+        await iterator.aclose()

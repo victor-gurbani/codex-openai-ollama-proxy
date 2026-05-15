@@ -73,6 +73,7 @@ PORT=8888
 CODEX_AUTH_PATH=~/.codex/auth.json
 API_KEY=ENTER_YOUR_DESIRED_API_KEY_HERE
 DEBUG=false
+DISABLE_COPILOT_ADAPTATIONS=false
 ```
 
 **Important: `API_KEY` here is not an OpenAI API key. It is simply a password-like token that you choose yourself to protect access to this proxy's incoming endpoints. You might not need to set `API_KEY` if you only use this locally.**
@@ -86,6 +87,8 @@ PORT=11434
 That is useful when you want clients to talk to the proxy on the same port they normally use for Ollama.
 
 If you set `DEBUG=true`, the proxy writes request/response trace logs for the backend-communicating endpoints to `logs/debug.log`.
+
+If you set `DISABLE_COPILOT_ADAPTATIONS=true`, Copilot-looking `/v1/responses` streams are returned as raw backend passthrough instead of applying the small compatibility repairs for tool-call event shape, missing `output_index`, missing function-call ids, or missing function-call status.
 
 Rules:
 

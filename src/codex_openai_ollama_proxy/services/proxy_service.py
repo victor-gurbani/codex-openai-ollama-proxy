@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import suppress
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime
@@ -54,6 +55,22 @@ TOOL_FOLLOW_UP_FINALIZE_HINT = (
     "request, respond with the final answer directly instead of requesting more tools. "
     "Only request another tool when the existing tool results are insufficient."
 )
+TOOL_FORCE_FINALIZE_HINT = (
+    "\n\nYou already have enough tool results to answer the user's request. "
+    "Do not request any more tools. Provide the final answer now using only the existing tool results."
+)
+
+MODEL_SELF_IDENTIFICATION_PATTERN = re.compile(
+    r"(state that you are using\s+)([^.\n]+)",
+    re.IGNORECASE,
+)
+PSEUDO_TOOL_LEAK_MARKERS = (
+    "to=functions.",
+    "to=multi_tool_use.",
+    '{"tool_uses":',
+    'recipient_name":"functions.',
+    'recipient_name":"multi_tool_use.',
+)
 
 
 def normalize_tool_turn_reasoning(
@@ -64,6 +81,28 @@ def normalize_tool_turn_reasoning(
     if tool_calls and content and not reasoning:
         return "", content
     return content, reasoning
+
+
+def strip_pseudo_tool_markup(text: str) -> str:
+    earliest_index: int | None = None
+    for marker in PSEUDO_TOOL_LEAK_MARKERS:
+        index = text.find(marker)
+        if index != -1 and (earliest_index is None or index < earliest_index):
+            earliest_index = index
+    return text[:earliest_index].rstrip() if earliest_index is not None else text
+
+
+class StreamTextLeakFilter:
+    def __init__(self) -> None:
+        self.drop_remaining = False
+
+    def sanitize(self, text: str) -> str:
+        if self.drop_remaining:
+            return ""
+        cleaned = strip_pseudo_tool_markup(text)
+        if cleaned != text:
+            self.drop_remaining = True
+        return cleaned
 
 
 class ProxyService:
@@ -98,6 +137,8 @@ class ProxyService:
             response_thinking,
             response_tool_calls,
         )
+        response_content = strip_pseudo_tool_markup(response_content)
+        response_thinking = strip_pseudo_tool_markup(response_thinking)
 
         finish_reason = "stop" if not response_tool_calls else "tool_calls"
         return ChatCompletionsResponse(
@@ -143,13 +184,17 @@ class ProxyService:
             buffered_content: list[str] = []
             emitted_reasoning = False
             saw_tool_calls = False
+            content_leak_filter = StreamTextLeakFilter()
+            reasoning_leak_filter = StreamTextLeakFilter()
 
             async def flush_buffered_content_as_content() -> AsyncIterator[str]:
                 nonlocal buffered_content
                 if not buffered_content:
                     return
                 for text in buffered_content:
-                    yield formatter.content_chunk(text)
+                    cleaned = content_leak_filter.sanitize(text)
+                    if cleaned:
+                        yield formatter.content_chunk(cleaned)
                 buffered_content = []
 
             if is_disconnected is not None and await is_disconnected():
@@ -190,16 +235,24 @@ class ProxyService:
                 elif isinstance(event, ThinkingDeltaEvent) and emit:
                     if buffered_content:
                         for text in buffered_content:
-                            yield formatter.content_chunk(text)
+                            cleaned = content_leak_filter.sanitize(text)
+                            if cleaned:
+                                yield formatter.content_chunk(cleaned)
                         buffered_content.clear()
-                    yield formatter.reasoning_chunk(event.text)
+                    cleaned_reasoning = reasoning_leak_filter.sanitize(event.text)
+                    if cleaned_reasoning:
+                        yield formatter.reasoning_chunk(cleaned_reasoning)
                     emitted_reasoning = True
                 elif isinstance(event, ThinkingDoneEvent) and emit:
                     if buffered_content:
                         for text in buffered_content:
-                            yield formatter.content_chunk(text)
+                            cleaned = content_leak_filter.sanitize(text)
+                            if cleaned:
+                                yield formatter.content_chunk(cleaned)
                         buffered_content.clear()
-                    yield formatter.reasoning_chunk(event.text)
+                    cleaned_reasoning = reasoning_leak_filter.sanitize(event.text)
+                    if cleaned_reasoning:
+                        yield formatter.reasoning_chunk(cleaned_reasoning)
                     emitted_reasoning = True
                 elif (
                     isinstance(event, ToolCallChunkEvent)
@@ -208,12 +261,16 @@ class ProxyService:
                 ):
                     if buffered_content and not emitted_reasoning:
                         for text in buffered_content:
-                            yield formatter.reasoning_chunk(text)
+                            cleaned = reasoning_leak_filter.sanitize(text)
+                            if cleaned:
+                                yield formatter.reasoning_chunk(cleaned)
                         buffered_content.clear()
                         emitted_reasoning = True
                     elif buffered_content:
                         for text in buffered_content:
-                            yield formatter.content_chunk(text)
+                            cleaned = content_leak_filter.sanitize(text)
+                            if cleaned:
+                                yield formatter.content_chunk(cleaned)
                         buffered_content.clear()
                     tool_call_signature = json.dumps(
                         [tool.model_dump(by_alias=True) for tool in state.tool_calls],
@@ -236,7 +293,10 @@ class ProxyService:
             if buffered_content:
                 chunk_writer = formatter.reasoning_chunk if saw_tool_calls and not emitted_reasoning else formatter.content_chunk
                 for text in buffered_content:
-                    yield chunk_writer(text)
+                    leak_filter = reasoning_leak_filter if chunk_writer is formatter.reasoning_chunk else content_leak_filter
+                    cleaned = leak_filter.sanitize(text)
+                    if cleaned:
+                        yield chunk_writer(cleaned)
 
             yield formatter.final_chunk(state.finish_reason)
             if include_usage and state.usage is not None:
@@ -248,6 +308,10 @@ class ProxyService:
     async def convert_chat_to_responses(
         self, chat_req: ChatCompletionsRequest
     ) -> ResponsesApiRequest:
+        normalized_messages = normalize_model_self_identification(
+            chat_req.messages,
+            chat_req.model,
+        )
         base_models = await self._model_catalog.get_base_models_for_request(chat_req.model)
         backend_model, reasoning = resolve_model_and_reasoning(
             chat_req.model,
@@ -262,14 +326,18 @@ class ProxyService:
             chat_req.temperature,
         )
         converted_tools = convert_chat_tools_to_responses(chat_req.tools)
+        if should_force_finalize_without_tools(chat_req):
+            converted_tools = []
         converted_tool_choice = convert_tool_choice(chat_req.tool_choice)
         text_config = build_responses_text_config(chat_req.response_format)
         input_items, instructions = convert_messages_to_input(
-            chat_req.messages,
+            normalized_messages,
             default_instructions=DEFAULT_SYSTEM_INSTRUCTIONS,
         )
         if should_append_tool_finalize_hint(chat_req):
             instructions += TOOL_FOLLOW_UP_FINALIZE_HINT
+        if should_force_finalize_without_tools(chat_req):
+            instructions += TOOL_FORCE_FINALIZE_HINT
 
         responses_request = ResponsesApiRequest(
             model=backend_model,
@@ -559,6 +627,39 @@ def should_append_tool_finalize_hint(chat_req: ChatCompletionsRequest) -> bool:
         assistant_message.role.lower() == "assistant"
         and bool(assistant_message.tool_calls)
     )
+
+
+def should_force_finalize_without_tools(chat_req: ChatCompletionsRequest) -> bool:
+    if not should_append_tool_finalize_hint(chat_req):
+        return False
+
+    tool_message_count = sum(1 for message in chat_req.messages if message.role.lower() == "tool")
+    user_message_count = sum(1 for message in chat_req.messages if message.role.lower() == "user")
+    assistant_message_count = sum(1 for message in chat_req.messages if message.role.lower() == "assistant")
+
+    return tool_message_count >= 50 and user_message_count <= 2 and assistant_message_count >= 15
+
+
+def normalize_model_self_identification(
+    messages: list[ChatMessage],
+    requested_model: str,
+) -> list[ChatMessage]:
+    normalized_messages: list[ChatMessage] = []
+    for message in messages:
+        if message.role.lower() != "system" or not isinstance(message.content, str):
+            normalized_messages.append(message)
+            continue
+
+        updated_content = MODEL_SELF_IDENTIFICATION_PATTERN.sub(
+            lambda match: f"{match.group(1)}{requested_model}",
+            message.content,
+        )
+        normalized_messages.append(
+            message.model_copy(update={"content": updated_content})
+            if updated_content != message.content
+            else message
+        )
+    return normalized_messages
 
 
 def build_responses_text_config(response_format: Any) -> Any:

@@ -191,6 +191,43 @@ def test_openai_streaming_moves_planning_content_into_reasoning_before_tool_call
     assert tool_index > reasoning_index
 
 
+def test_openai_streaming_strips_pseudo_tool_markup_from_content_chunks(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.output_text.delta","delta":"Here are the findings."}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"to=functions.exec_command {\\"cmd\\":\\"pwd\\"}"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"This should be suppressed too."}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-5.4",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'Here are the findings.' in body
+    assert 'to=functions.exec_command' not in body
+    assert 'This should be suppressed too.' not in body
+
+
 def test_openai_streaming_reasoning_only_backend_response_emits_reasoning_deltas(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})

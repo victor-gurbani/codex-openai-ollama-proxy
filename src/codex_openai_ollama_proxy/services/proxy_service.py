@@ -5,6 +5,7 @@ import json
 import re
 from contextlib import suppress
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -29,6 +30,7 @@ from codex_openai_ollama_proxy.schemas.openai import (
     ChatCompletionsResponse,
     ChatMessage,
     ChatResponseMessage,
+    ChatToolCall,
     Choice,
 )
 from codex_openai_ollama_proxy.schemas.usage import Usage
@@ -42,6 +44,7 @@ from codex_openai_ollama_proxy.services.model_catalog import ModelCatalogService
 from codex_openai_ollama_proxy.services.model_resolution import (
     normalize_ollama_think,
     resolve_model_and_reasoning,
+    resolve_model_alias,
     resolve_temperature,
 )
 from codex_openai_ollama_proxy.services.stream_state import StreamState
@@ -65,12 +68,26 @@ MODEL_SELF_IDENTIFICATION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 PSEUDO_TOOL_LEAK_MARKERS = (
+    "to=terminal.",
+    "to=terminal.run",
     "to=functions.",
+    "to=functions.exec_command",
     "to=multi_tool_use.",
+    "to=multi_tool_use.parallel",
+    "terminal.run",
+    "functions.exec_command",
     '{"tool_uses":',
+    '"command":"',
+    '"cwd":"',
+    '"to":"terminal.',
+    '"to":"functions.',
+    '"to":"multi_tool_use.',
     'recipient_name":"functions.',
     'recipient_name":"multi_tool_use.',
+    'recipient_name":"terminal.',
 )
+MAX_PSEUDO_TOOL_LEAK_MARKER_LENGTH = max(len(marker) for marker in PSEUDO_TOOL_LEAK_MARKERS)
+MIN_PSEUDO_TOOL_LEAK_MARKER_PREFIX_LENGTH = 3
 
 
 def normalize_tool_turn_reasoning(
@@ -95,14 +112,39 @@ def strip_pseudo_tool_markup(text: str) -> str:
 class StreamTextLeakFilter:
     def __init__(self) -> None:
         self.drop_remaining = False
+        self._pending = ""
 
     def sanitize(self, text: str) -> str:
         if self.drop_remaining:
             return ""
-        cleaned = strip_pseudo_tool_markup(text)
-        if cleaned != text:
+        combined = self._pending + text
+        self._pending = ""
+        cleaned = strip_pseudo_tool_markup(combined)
+        if cleaned != combined:
             self.drop_remaining = True
+            return cleaned
+        marker_prefix = longest_pseudo_tool_marker_prefix_suffix(combined)
+        if marker_prefix:
+            self._pending = marker_prefix
+            return combined[: -len(marker_prefix)]
         return cleaned
+
+    def flush(self) -> str:
+        if self.drop_remaining:
+            self._pending = ""
+            return ""
+        pending = self._pending
+        self._pending = ""
+        return pending
+
+
+def longest_pseudo_tool_marker_prefix_suffix(text: str) -> str:
+    max_length = min(len(text), MAX_PSEUDO_TOOL_LEAK_MARKER_LENGTH - 1)
+    for length in range(max_length, MIN_PSEUDO_TOOL_LEAK_MARKER_PREFIX_LENGTH - 1, -1):
+        suffix = text[-length:]
+        if any(marker.startswith(suffix) for marker in PSEUDO_TOOL_LEAK_MARKERS):
+            return suffix
+    return ""
 
 
 class ProxyService:
@@ -180,7 +222,7 @@ class ProxyService:
 
         async def iterator() -> AsyncIterator[str]:
             disconnected = False
-            last_tool_call_signature: str | None = None
+            last_tool_call_signatures: dict[str, str] = {}
             buffered_content: list[str] = []
             emitted_reasoning = False
             saw_tool_calls = False
@@ -238,6 +280,9 @@ class ProxyService:
                             cleaned = content_leak_filter.sanitize(text)
                             if cleaned:
                                 yield formatter.content_chunk(cleaned)
+                        flushed_content = content_leak_filter.flush()
+                        if flushed_content:
+                            yield formatter.content_chunk(flushed_content)
                         buffered_content.clear()
                     cleaned_reasoning = reasoning_leak_filter.sanitize(event.text)
                     if cleaned_reasoning:
@@ -249,6 +294,9 @@ class ProxyService:
                             cleaned = content_leak_filter.sanitize(text)
                             if cleaned:
                                 yield formatter.content_chunk(cleaned)
+                        flushed_content = content_leak_filter.flush()
+                        if flushed_content:
+                            yield formatter.content_chunk(flushed_content)
                         buffered_content.clear()
                     cleaned_reasoning = reasoning_leak_filter.sanitize(event.text)
                     if cleaned_reasoning:
@@ -264,6 +312,9 @@ class ProxyService:
                             cleaned = reasoning_leak_filter.sanitize(text)
                             if cleaned:
                                 yield formatter.reasoning_chunk(cleaned)
+                        flushed_reasoning = reasoning_leak_filter.flush()
+                        if flushed_reasoning:
+                            yield formatter.reasoning_chunk(flushed_reasoning)
                         buffered_content.clear()
                         emitted_reasoning = True
                     elif buffered_content:
@@ -271,15 +322,18 @@ class ProxyService:
                             cleaned = content_leak_filter.sanitize(text)
                             if cleaned:
                                 yield formatter.content_chunk(cleaned)
+                        flushed_content = content_leak_filter.flush()
+                        if flushed_content:
+                            yield formatter.content_chunk(flushed_content)
                         buffered_content.clear()
                     tool_call_signature = json.dumps(
-                        [tool.model_dump(by_alias=True) for tool in state.tool_calls],
+                        asdict(event),
                         separators=(",", ":"),
                         sort_keys=True,
                     )
-                    if tool_call_signature != last_tool_call_signature:
-                        yield formatter.tool_calls_chunk(state.tool_calls)
-                        last_tool_call_signature = tool_call_signature
+                    if tool_call_signature != last_tool_call_signatures.get(event.item_id):
+                        yield formatter.tool_call_chunk(event)
+                        last_tool_call_signatures[event.item_id] = tool_call_signature
                     saw_tool_calls = True
 
             if disconnected:
@@ -297,6 +351,16 @@ class ProxyService:
                     cleaned = leak_filter.sanitize(text)
                     if cleaned:
                         yield chunk_writer(cleaned)
+                flushed = leak_filter.flush()
+                if flushed:
+                    yield chunk_writer(flushed)
+
+            flushed_content = content_leak_filter.flush()
+            if flushed_content:
+                yield formatter.content_chunk(flushed_content)
+            flushed_reasoning = reasoning_leak_filter.flush()
+            if flushed_reasoning:
+                yield formatter.reasoning_chunk(flushed_reasoning)
 
             yield formatter.final_chunk(state.finish_reason)
             if include_usage and state.usage is not None:
@@ -361,10 +425,17 @@ class ProxyService:
         request_body: bytes,
         incoming_headers: Mapping[str, str] | None = None,
     ) -> httpx.Response:
+        request_model = extract_responses_model(request_body)
+        base_models = (
+            await self._model_catalog.get_base_models_for_request(request_model)
+            if request_model is not None
+            else self._model_catalog.cached_or_fallback_base_models()
+        )
         request_body = normalize_responses_body_for_backend(
             request_body,
             default_effort="xhigh",
             default_instructions=DEFAULT_SYSTEM_INSTRUCTIONS,
+            base_models=base_models,
         )
         return await self._backend_client.open_responses_passthrough(
             request_body,
@@ -440,6 +511,11 @@ class ProxyService:
         async def iterator() -> AsyncIterator[str]:
             disconnected = False
             last_tool_call_signature: str | None = None
+            buffered_content: list[str] = []
+            emitted_thinking = False
+            saw_tool_calls = False
+            content_leak_filter = StreamTextLeakFilter()
+            thinking_leak_filter = StreamTextLeakFilter()
             if is_disconnected is not None and await is_disconnected():
                 return
             lines = await self._backend_client.stream_responses_request(responses_req)
@@ -468,14 +544,62 @@ class ProxyService:
                     )
                 emit = state.apply(event)
                 if isinstance(event, TextDeltaEvent) and emit:
-                    yield formatter.content_chunk(event.text)
+                    buffered_content.append(event.text)
                 elif isinstance(event, TextDoneEvent) and emit:
-                    yield formatter.content_chunk(event.text)
+                    buffered_content.append(event.text)
                 elif isinstance(event, ThinkingDeltaEvent) and emit:
-                    yield formatter.thinking_chunk(event.text)
+                    if buffered_content:
+                        for text in buffered_content:
+                            cleaned = content_leak_filter.sanitize(text)
+                            if cleaned:
+                                yield formatter.content_chunk(cleaned)
+                        flushed_content = content_leak_filter.flush()
+                        if flushed_content:
+                            yield formatter.content_chunk(flushed_content)
+                        buffered_content.clear()
+                    cleaned = thinking_leak_filter.sanitize(event.text)
+                    if cleaned:
+                        yield formatter.thinking_chunk(cleaned)
+                    emitted_thinking = True
                 elif isinstance(event, ThinkingDoneEvent) and emit:
-                    yield formatter.thinking_chunk(event.text)
-                elif isinstance(event, ToolCallChunkEvent) and mode == "chat" and state.tool_calls:
+                    if buffered_content:
+                        for text in buffered_content:
+                            cleaned = content_leak_filter.sanitize(text)
+                            if cleaned:
+                                yield formatter.content_chunk(cleaned)
+                        flushed_content = content_leak_filter.flush()
+                        if flushed_content:
+                            yield formatter.content_chunk(flushed_content)
+                        buffered_content.clear()
+                    cleaned = thinking_leak_filter.sanitize(event.text)
+                    if cleaned:
+                        yield formatter.thinking_chunk(cleaned)
+                    emitted_thinking = True
+                elif (
+                    isinstance(event, ToolCallChunkEvent)
+                    and event.is_final
+                    and mode == "chat"
+                    and state.tool_calls
+                ):
+                    if buffered_content and not emitted_thinking:
+                        for text in buffered_content:
+                            cleaned = thinking_leak_filter.sanitize(text)
+                            if cleaned:
+                                yield formatter.thinking_chunk(cleaned)
+                        flushed_thinking = thinking_leak_filter.flush()
+                        if flushed_thinking:
+                            yield formatter.thinking_chunk(flushed_thinking)
+                        buffered_content.clear()
+                        emitted_thinking = True
+                    elif buffered_content:
+                        for text in buffered_content:
+                            cleaned = content_leak_filter.sanitize(text)
+                            if cleaned:
+                                yield formatter.content_chunk(cleaned)
+                        flushed_content = content_leak_filter.flush()
+                        if flushed_content:
+                            yield formatter.content_chunk(flushed_content)
+                        buffered_content.clear()
                     tool_call_signature = json.dumps(
                         [tool.model_dump(by_alias=True) for tool in state.tool_calls],
                         separators=(",", ":"),
@@ -484,6 +608,7 @@ class ProxyService:
                     if tool_call_signature != last_tool_call_signature:
                         yield formatter.tool_call_snapshot_chunk(state.tool_calls)
                         last_tool_call_signature = tool_call_signature
+                    saw_tool_calls = True
 
             if disconnected:
                 return
@@ -492,6 +617,24 @@ class ProxyService:
                 raise EmptyBackendResponseError(
                     "Empty content and no tool calls returned from ChatGPT backend"
                 )
+
+            if buffered_content:
+                chunk_writer = formatter.thinking_chunk if saw_tool_calls and not emitted_thinking else formatter.content_chunk
+                leak_filter = thinking_leak_filter if chunk_writer is formatter.thinking_chunk else content_leak_filter
+                for text in buffered_content:
+                    cleaned = leak_filter.sanitize(text)
+                    if cleaned:
+                        yield chunk_writer(cleaned)
+                flushed = leak_filter.flush()
+                if flushed:
+                    yield chunk_writer(flushed)
+
+            flushed_content = content_leak_filter.flush()
+            if flushed_content:
+                yield formatter.content_chunk(flushed_content)
+            flushed_thinking = thinking_leak_filter.flush()
+            if flushed_thinking:
+                yield formatter.thinking_chunk(flushed_thinking)
 
             yield formatter.final_chunk(state.usage)
 
@@ -756,8 +899,6 @@ RESPONSES_UNSUPPORTED_FIELDS = frozenset(
         "frequency_penalty",
         "stop",
         "n",
-        "previous_response_id",
-        "conversation",
         "truncation",
     }
 )
@@ -768,6 +909,7 @@ def normalize_responses_body_for_backend(
     *,
     default_effort: str,
     default_instructions: str,
+    base_models: list[str] | None = None,
 ) -> bytes:
     try:
         payload = json.loads(request_body)
@@ -784,8 +926,27 @@ def normalize_responses_body_for_backend(
     ).strip():
         updated_payload["instructions"] = default_instructions
 
-    if "reasoning_effort" in updated_payload and "reasoning" not in updated_payload:
-        updated_payload["reasoning"] = {"effort": updated_payload.pop("reasoning_effort")}
+    reasoning_effort = updated_payload.pop("reasoning_effort", None)
+
+    model = updated_payload.get("model")
+    if isinstance(model, str):
+        backend_model, model_effort = resolve_model_alias(model, base_models)
+        updated_payload["model"] = backend_model
+        if model_effort is not None:
+            _, resolved_reasoning = resolve_model_and_reasoning(
+                model,
+                updated_payload.get("reasoning"),
+                reasoning_effort if isinstance(reasoning_effort, str) else None,
+                base_models,
+            )
+            if resolved_reasoning is not None:
+                updated_payload["reasoning"] = resolved_reasoning
+            else:
+                updated_payload.pop("reasoning", None)
+        elif isinstance(reasoning_effort, str) and "reasoning" not in updated_payload:
+            updated_payload["reasoning"] = {"effort": reasoning_effort}
+    elif isinstance(reasoning_effort, str) and "reasoning" not in updated_payload:
+        updated_payload["reasoning"] = {"effort": reasoning_effort}
 
     normalized_payload = with_default_reasoning_effort(
         updated_payload,
@@ -818,6 +979,17 @@ def normalize_responses_body_for_backend(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def extract_responses_model(request_body: bytes) -> str | None:
+    try:
+        payload = json.loads(request_body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    model = payload.get("model")
+    return model if isinstance(model, str) else None
 
 
 def with_default_reasoning_effort(

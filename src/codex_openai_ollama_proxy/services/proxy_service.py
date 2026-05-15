@@ -592,6 +592,7 @@ class ProxyService:
 
         formatter = OllamaStreamFormatter(requested_model, mode=mode)
         state = StreamState()
+        request_has_tools = bool(getattr(request, "tools", None))
 
         async def iterator() -> AsyncIterator[str]:
             disconnected = False
@@ -629,9 +630,19 @@ class ProxyService:
                     )
                 emit = state.apply(event)
                 if isinstance(event, TextDeltaEvent) and emit:
-                    buffered_content.append(event.text)
+                    if emitted_thinking or not request_has_tools:
+                        cleaned = content_leak_filter.sanitize(event.text)
+                        if cleaned:
+                            yield formatter.content_chunk(cleaned)
+                    else:
+                        buffered_content.append(event.text)
                 elif isinstance(event, TextDoneEvent) and emit:
-                    buffered_content.append(event.text)
+                    if emitted_thinking or not request_has_tools:
+                        cleaned = content_leak_filter.sanitize(event.text)
+                        if cleaned:
+                            yield formatter.content_chunk(cleaned)
+                    else:
+                        buffered_content.append(event.text)
                 elif isinstance(event, ThinkingDeltaEvent) and emit:
                     if buffered_content:
                         for text in buffered_content:

@@ -191,6 +191,46 @@ def test_ollama_chat_streaming_emits_thinking_chunks(tmp_path: Path) -> None:
     assert '"done":true' in lines[-1]
 
 
+def test_ollama_chat_streaming_emits_answer_deltas_after_thinking(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"Thinking..."}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Hel"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"lo"}\n\n'
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text=backend_body)
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/chat",
+                json={
+                    "model": "gpt-5.4:latest",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                    "think": True,
+                },
+            )
+
+    assert response.status_code == 200
+    lines = [line for line in response.text.splitlines() if line.strip()]
+
+    thinking_index = next(index for index, line in enumerate(lines) if '"thinking":"Thinking..."' in line)
+    first_content_index = next(index for index, line in enumerate(lines) if '"content":"Hel"' in line)
+    second_content_index = next(index for index, line in enumerate(lines) if '"content":"lo"' in line)
+    done_index = next(index for index, line in enumerate(lines) if '"done":true' in line)
+
+    assert thinking_index < first_content_index < second_content_index < done_index
+
+
 def test_ollama_generate_streaming_emits_thinking_chunks(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})

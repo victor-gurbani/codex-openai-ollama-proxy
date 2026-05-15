@@ -89,7 +89,7 @@ If you set `DEBUG=true`, the proxy writes request/response trace logs for the ba
 
 Rules:
 
-1. If `API_KEY` is set, `/health`, `/api/tags`, and `/api/ps` stay public and the rest require that key.
+1. If `API_KEY` is set, `/health`, `/api/version`, `/api/tags`, and `/api/ps` stay public and the rest require that key.
 2. If `API_KEY` is not set, the proxy allows unauthenticated access. This is the default when you have no `.env` override.
 
 ## Endpoint Policy
@@ -97,6 +97,7 @@ Rules:
 Public when `API_KEY` is configured:
 
 - `GET /health`
+- `GET /api/version`
 - `GET /api/tags`
 - `GET /api/ps`
 
@@ -104,7 +105,6 @@ Protected when `API_KEY` is configured:
 
 - `GET /models`
 - `GET /v1/models`
-- `GET /api/version`
 - `POST /responses`
 - `POST /chat/completions`
 - `POST /v1/responses`

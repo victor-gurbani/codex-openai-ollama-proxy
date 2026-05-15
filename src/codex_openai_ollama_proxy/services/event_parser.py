@@ -22,6 +22,35 @@ from codex_openai_ollama_proxy.services.stream_state import StreamState
 from codex_openai_ollama_proxy.services.usage_extraction import extract_usage_from_event
 
 
+TEXT_DELTA_EVENT_TYPES = {"response.output_text.delta"}
+TEXT_DONE_EVENT_TYPES = {"response.output_text.done"}
+THINKING_DELTA_EVENT_TYPES = {
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_text.delta",
+}
+THINKING_DONE_EVENT_TYPES = {
+    "response.reasoning_summary_text.done",
+    "response.reasoning_text.done",
+}
+THINKING_SUMMARY_PART_DONE_EVENT_TYPES = {"response.reasoning_summary_part.done"}
+FUNCTION_CALL_ARGUMENTS_DELTA_EVENT_TYPES = {
+    "response.function_call_arguments.delta",
+    "response.function_call.arguments.delta",
+    "response.function_call.delta",
+    "response.tool_call_arguments.delta",
+    "response.tool_call.arguments.delta",
+    "response.tool_call.delta",
+}
+FUNCTION_CALL_ARGUMENTS_DONE_EVENT_TYPES = {
+    "response.function_call_arguments.done",
+    "response.function_call.arguments.done",
+    "response.function_call.done",
+    "response.tool_call_arguments.done",
+    "response.tool_call.arguments.done",
+    "response.tool_call.done",
+}
+
+
 @dataclass(slots=True)
 class FunctionCallState:
     item_id: str
@@ -155,21 +184,33 @@ class BackendEventParser:
             return parsed_events
 
         event_type = event.get("type") or sse_event_name
-        if event_type == "response.output_text.delta":
+        if event_type in TEXT_DELTA_EVENT_TYPES:
             delta = event.get("delta")
             if isinstance(delta, str):
                 parsed_events.append(TextDeltaEvent(delta))
             return parsed_events
 
-        if event_type == "response.reasoning_summary_text.delta":
+        if event_type in TEXT_DONE_EVENT_TYPES:
+            text = event.get("text")
+            if isinstance(text, str):
+                parsed_events.append(TextDoneEvent(text))
+            return parsed_events
+
+        if event_type in THINKING_DELTA_EVENT_TYPES:
             delta = event.get("delta")
             if isinstance(delta, str):
                 parsed_events.append(ThinkingDeltaEvent(delta))
             return parsed_events
 
-        if event_type == "response.reasoning_summary_text.done":
+        if event_type in THINKING_DONE_EVENT_TYPES:
             text = event.get("text")
             if isinstance(text, str):
+                parsed_events.append(ThinkingDoneEvent(text))
+            return parsed_events
+
+        if event_type in THINKING_SUMMARY_PART_DONE_EVENT_TYPES:
+            text = extract_text_from_part(event.get("part"))
+            if text is not None:
                 parsed_events.append(ThinkingDoneEvent(text))
             return parsed_events
 
@@ -181,11 +222,27 @@ class BackendEventParser:
                     parsed_events.append(tool_event)
             return parsed_events
 
-        if event_type == "response.function_call_arguments.delta":
+        if event_type in FUNCTION_CALL_ARGUMENTS_DELTA_EVENT_TYPES:
             item_id = event.get("item_id")
-            delta = event.get("delta")
+            delta = event.get("delta") or event.get("arguments_delta")
             if isinstance(item_id, str) and isinstance(delta, str):
                 tool_event = self._parse_function_call_delta(item_id, delta)
+                if tool_event is not None:
+                    parsed_events.append(tool_event)
+            return parsed_events
+
+        if event_type in FUNCTION_CALL_ARGUMENTS_DONE_EVENT_TYPES:
+            item_id = event.get("item_id")
+            name = event.get("name")
+            arguments = event.get("arguments")
+            call_id = event.get("call_id")
+            if isinstance(item_id, str):
+                tool_event = self._parse_function_call_arguments_done(
+                    item_id,
+                    name if isinstance(name, str) else None,
+                    arguments if isinstance(arguments, str) else "",
+                    call_id if isinstance(call_id, str) else None,
+                )
                 if tool_event is not None:
                     parsed_events.append(tool_event)
             return parsed_events
@@ -329,6 +386,42 @@ class BackendEventParser:
             is_final=True,
         )
 
+    def _parse_function_call_arguments_done(
+        self,
+        item_id: str,
+        name: str | None,
+        arguments: str,
+        call_id: str | None,
+    ) -> ToolCallChunkEvent | None:
+        state = self._function_calls.get(item_id)
+        if state is None:
+            if name is None:
+                return None
+            state = FunctionCallState(
+                item_id=item_id,
+                index=self._next_tool_index,
+                tool_call_id=call_id or item_id,
+                name=name,
+                arguments=arguments,
+            )
+            self._function_calls[item_id] = state
+            self._next_tool_index += 1
+        else:
+            if call_id is not None:
+                state.tool_call_id = call_id
+            if name is not None:
+                state.name = name
+            state.arguments = arguments
+
+        return ToolCallChunkEvent(
+            item_id=item_id,
+            index=state.index,
+            tool_call_id=state.tool_call_id,
+            name=state.name,
+            arguments=state.arguments,
+            is_final=True,
+        )
+
 
 def parse_optional_int(value: Any) -> int | None:
     if isinstance(value, bool) or value is None:
@@ -343,6 +436,13 @@ def parse_optional_int(value: Any) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def extract_text_from_part(part: Any) -> str | None:
+    if not isinstance(part, dict):
+        return None
+    text = part.get("text")
+    return text if isinstance(text, str) else None
 
 
 def iter_events_from_sse_lines(lines: Iterable[str]) -> list[StreamEvent]:

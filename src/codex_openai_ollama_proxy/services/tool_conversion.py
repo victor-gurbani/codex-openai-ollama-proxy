@@ -34,21 +34,17 @@ def parse_function_arguments(arguments: str) -> Any:
 
 
 def convert_chat_tool_call_to_ollama(tool_call: Any, *, index: int | None = None) -> dict[str, Any]:
-    function_payload = {
-        "name": tool_call.function.name,
-        "arguments": parse_function_arguments(tool_call.function.arguments),
+    function_payload: dict[str, Any] = {
+            "name": tool_call.function.name,
+            "arguments": parse_function_arguments(tool_call.function.arguments),
     }
     if index is not None:
         function_payload["index"] = index
 
-    payload: dict[str, Any] = {
-        "type": "function",
-        "function": function_payload,
-    }
+    payload: dict[str, Any] = {"function": function_payload}
     if tool_call.id is not None:
         payload["id"] = tool_call.id
     return payload
-
 
 def convert_chat_tool_calls_to_ollama(tool_calls: list[Any] | None) -> list[dict[str, Any]] | None:
     if not tool_calls:

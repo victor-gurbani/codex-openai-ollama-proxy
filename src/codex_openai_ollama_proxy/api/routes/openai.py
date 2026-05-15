@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.datastructures import Headers
 
-from codex_openai_ollama_proxy.api.deps import get_proxy_service
+from codex_openai_ollama_proxy.api.deps import get_proxy_service, get_settings
+from codex_openai_ollama_proxy.core.config import Settings
 from codex_openai_ollama_proxy.core.debug_trace import (
     finish_debug_request,
     log_debug_event,
@@ -17,9 +18,6 @@ from codex_openai_ollama_proxy.schemas.openai import ChatCompletionsRequest
 from codex_openai_ollama_proxy.services.event_parser import (
     FUNCTION_CALL_ARGUMENTS_DELTA_EVENT_TYPES,
     FUNCTION_CALL_ARGUMENTS_DONE_EVENT_TYPES,
-    THINKING_DELTA_EVENT_TYPES,
-    THINKING_DONE_EVENT_TYPES,
-    THINKING_SUMMARY_PART_DONE_EVENT_TYPES,
 )
 from codex_openai_ollama_proxy.services.proxy_service import ProxyService
 from codex_openai_ollama_proxy.services.streaming_formatter import build_openai_error_sse
@@ -81,7 +79,6 @@ def _is_copilot_responses_client(headers: Headers) -> bool:
     return (
         user_agent.startswith("Ucr/JS ")
         or user_agent.startswith("GitHubCopilotChat/")
-        or headers.get("x-stainless-package-version") is not None
         or headers.get("x-vscode-user-agent-library-version") is not None
     )
 
@@ -112,14 +109,6 @@ def _is_visible_output_event(payload: dict) -> bool:
         item = payload.get("item")
         return isinstance(item, dict) and item.get("type") == "message"
     return False
-
-
-def _is_reasoning_output_event(payload: dict) -> bool:
-    return payload.get("type") in (
-        THINKING_DELTA_EVENT_TYPES
-        | THINKING_DONE_EVENT_TYPES
-        | THINKING_SUMMARY_PART_DONE_EVENT_TYPES
-    )
 
 
 def _has_function_call(payload: dict) -> bool:
@@ -154,27 +143,6 @@ def _function_call_event_id(payload: dict) -> str | None:
     return None
 
 
-def _drop_completed_visible_messages_after_tool_calls(payload: dict) -> dict:
-    response = payload.get("response")
-    if not isinstance(response, dict):
-        return payload
-    output = response.get("output")
-    if not isinstance(output, list):
-        return payload
-    if not any(isinstance(item, dict) and item.get("type") == "function_call" for item in output):
-        return payload
-
-    updated_response = dict(response)
-    updated_response["output"] = [
-        item
-        for item in output
-        if not (isinstance(item, dict) and item.get("type") == "message")
-    ]
-    updated_payload = dict(payload)
-    updated_payload["response"] = updated_response
-    return updated_payload
-
-
 def _completed_response_with_function_calls(
     payload: dict,
     function_call_items: dict[str, dict],
@@ -187,17 +155,21 @@ def _completed_response_with_function_calls(
     if not isinstance(output, list):
         output = []
 
-    completed_function_calls: list[dict] = []
+    completed_output: list[dict] = []
     seen_call_ids: set[str] = set()
     for item in output:
-        if not (isinstance(item, dict) and item.get("type") == "function_call"):
+        if not isinstance(item, dict):
+            completed_output.append(item)
+            continue
+        if item.get("type") != "function_call":
+            completed_output.append(item)
             continue
         canonical_item = dict(item)
         canonical_item["status"] = "completed"
         call_id = canonical_item.get("call_id") or canonical_item.get("id")
         if isinstance(call_id, str):
             seen_call_ids.add(call_id)
-        completed_function_calls.append(canonical_item)
+        completed_output.append(canonical_item)
 
     for item in function_call_items.values():
         call_id = item.get("call_id") or item.get("id")
@@ -207,32 +179,78 @@ def _completed_response_with_function_calls(
         canonical_item["status"] = "completed"
         if isinstance(call_id, str):
             seen_call_ids.add(call_id)
-        completed_function_calls.append(canonical_item)
+        completed_output.append(canonical_item)
 
-    if not completed_function_calls:
+    if completed_output == output:
         return payload
 
     updated_response = dict(response)
-    updated_response["output"] = completed_function_calls
+    updated_response["output"] = completed_output
     updated_payload = dict(payload)
     updated_payload["response"] = updated_response
     return updated_payload
 
 
-def _normalize_copilot_tool_output_index(payload: dict) -> dict:
+def _record_function_call_output_index(
+    payload: dict,
+    function_call_output_indexes: dict[str, int],
+) -> None:
+    output_index = payload.get("output_index")
+    if not isinstance(output_index, int):
+        return
+
+    item = payload.get("item")
+    if isinstance(item, dict) and item.get("type") == "function_call":
+        for item_id in _function_call_item_ids(item):
+            function_call_output_indexes[item_id] = output_index
+
+    event_id = _function_call_event_id(payload)
+    if event_id is not None:
+        function_call_output_indexes[event_id] = output_index
+
+
+def _function_call_output_index(
+    payload: dict,
+    function_call_output_indexes: dict[str, int],
+    default_output_index: int,
+) -> int:
+    item = payload.get("item")
+    if isinstance(item, dict):
+        for item_id in _function_call_item_ids(item):
+            known_output_index = function_call_output_indexes.get(item_id)
+            if known_output_index is not None:
+                return known_output_index
+
+    event_id = _function_call_event_id(payload)
+    if event_id is not None:
+        known_output_index = function_call_output_indexes.get(event_id)
+        if known_output_index is not None:
+            return known_output_index
+
+    return default_output_index
+
+
+def _normalize_copilot_tool_output_index(
+    payload: dict,
+    function_call_output_indexes: dict[str, int],
+    default_output_index: int,
+) -> dict:
     event_type = payload.get("type")
     item = payload.get("item")
     is_function_item = isinstance(item, dict) and item.get("type") == "function_call"
-    is_function_arguments = event_type in {
-        "response.function_call_arguments.delta",
-        "response.function_call_arguments.done",
-    }
+    is_function_arguments = event_type in (
+        FUNCTION_CALL_ARGUMENTS_DELTA_EVENT_TYPES | FUNCTION_CALL_ARGUMENTS_DONE_EVENT_TYPES
+    )
     if not is_function_item and not is_function_arguments:
         return payload
     if "output_index" in payload:
         return payload
     updated_payload = dict(payload)
-    updated_payload["output_index"] = 1
+    updated_payload["output_index"] = _function_call_output_index(
+        payload,
+        function_call_output_indexes,
+        default_output_index,
+    )
     return updated_payload
 
 
@@ -257,6 +275,8 @@ def _canonicalize_copilot_function_call(
         canonical_item.setdefault("call_id", item_id)
         for alias_id in _function_call_item_ids(canonical_item):
             function_call_items[alias_id] = canonical_item
+        if canonical_item == item:
+            return updated_payload
         updated_payload["item"] = canonical_item
         updated_payload["response"] = {"output": [canonical_item]}
         return updated_payload
@@ -379,6 +399,7 @@ async def chat_completions(
 @router.post("/v1/responses")
 async def responses_passthrough(
     raw_request: Request,
+    settings: Settings = Depends(get_settings),
     proxy_service: ProxyService = Depends(get_proxy_service),
 ):
     request_body = await raw_request.body()
@@ -413,7 +434,10 @@ async def responses_passthrough(
 
     if should_stream_response:
         stream_media_type = media_type if _is_sse_media_type(media_type) else "text/event-stream"
-        should_normalize_copilot_stream = _is_copilot_responses_client(raw_request.headers)
+        should_normalize_copilot_stream = (
+            not settings.disable_copilot_adaptations
+            and _is_copilot_responses_client(raw_request.headers)
+        )
 
         async def stream_passthrough():
             emitted_chunks: list[bytes] = []
@@ -443,17 +467,14 @@ async def responses_passthrough(
 
             pending_event_name: str | None = None
             pending_data_lines: list[str] = []
-            buffered_visible_chunks: list[bytes] = []
             function_call_items: dict[str, dict] = {}
+            function_call_output_indexes: dict[str, int] = {}
+            saw_visible_output_before_function_call = False
             saw_function_call = False
 
             async def emit_event(event_name: str | None, data_text: str):
-                nonlocal saw_function_call, buffered_visible_chunks
+                nonlocal saw_function_call, saw_visible_output_before_function_call
                 if data_text.strip() == "[DONE]":
-                    if not saw_function_call:
-                        for buffered_chunk in buffered_visible_chunks:
-                            yield buffered_chunk
-                        buffered_visible_chunks = []
                     yield _encode_sse_event(event_name, data_text)
                     return
 
@@ -461,10 +482,6 @@ async def responses_passthrough(
                     payload = json.loads(data_text)
                 except (TypeError, ValueError):
                     chunk = _encode_sse_event(event_name, data_text)
-                    if buffered_visible_chunks and not saw_function_call:
-                        for buffered_chunk in buffered_visible_chunks:
-                            yield buffered_chunk
-                        buffered_visible_chunks = []
                     yield chunk
                     return
 
@@ -472,28 +489,28 @@ async def responses_passthrough(
                     yield _encode_sse_event(event_name, data_text)
                     return
 
+                default_output_index = 0
                 if _has_function_call(payload):
+                    default_output_index = 1 if saw_visible_output_before_function_call else 0
                     saw_function_call = True
-                    buffered_visible_chunks = []
                     payload = _canonicalize_copilot_function_call(payload, function_call_items)
+                    _record_function_call_output_index(payload, function_call_output_indexes)
 
-                if (
-                    _is_visible_output_event(payload) or _is_reasoning_output_event(payload)
-                ) and not saw_function_call:
-                    buffered_visible_chunks.append(_encode_sse_event(event_name, payload))
-                    return
+                if _is_visible_output_event(payload) and not saw_function_call:
+                    saw_visible_output_before_function_call = True
 
                 if payload.get("type") == "response.completed" and saw_function_call:
-                    payload = _drop_completed_visible_messages_after_tool_calls(payload)
                     payload = _completed_response_with_function_calls(payload, function_call_items)
                 if saw_function_call:
                     payload = _canonicalize_copilot_function_call(payload, function_call_items)
-                    payload = _normalize_copilot_tool_output_index(payload)
+                    _record_function_call_output_index(payload, function_call_output_indexes)
+                    payload = _normalize_copilot_tool_output_index(
+                        payload,
+                        function_call_output_indexes,
+                        default_output_index,
+                    )
+                    _record_function_call_output_index(payload, function_call_output_indexes)
 
-                if not saw_function_call and buffered_visible_chunks:
-                    for buffered_chunk in buffered_visible_chunks:
-                        yield buffered_chunk
-                    buffered_visible_chunks = []
                 yield _encode_sse_event(event_name, payload)
 
             try:

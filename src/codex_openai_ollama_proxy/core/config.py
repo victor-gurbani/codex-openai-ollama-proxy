@@ -89,6 +89,7 @@ class Settings:
     service_name: str = "codex-openai-ollama-proxy"
     service_version: str = "0.1.0"
     ollama_compat_version: str = DEFAULT_OLLAMA_COMPAT_VERSION
+    disable_copilot_adaptations: bool = False
     public_paths: frozenset[str] = field(
         default_factory=lambda: frozenset(
             {
@@ -145,6 +146,9 @@ class Settings:
             normalize_optional(os.getenv("OLLAMA_COMPAT_VERSION"))
             or DEFAULT_OLLAMA_COMPAT_VERSION
         )
+        disable_copilot_adaptations = normalize_bool(
+            os.getenv("DISABLE_COPILOT_ADAPTATIONS")
+        )
 
         return cls(
             port=port,
@@ -159,4 +163,5 @@ class Settings:
             backend_models_client_version=backend_models_client_version,
             oauth_token_url=oauth_token_url,
             ollama_compat_version=ollama_compat_version,
+            disable_copilot_adaptations=disable_copilot_adaptations,
         )

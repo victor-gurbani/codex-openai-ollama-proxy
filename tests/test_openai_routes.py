@@ -19,6 +19,7 @@ def build_settings(
     auth_path: Path,
     *,
     debug: bool = False,
+    disable_copilot_adaptations: bool = False,
     project_root: Path | None = None,
 ) -> Settings:
     return Settings(
@@ -29,6 +30,7 @@ def build_settings(
         project_root=project_root or Path.cwd(),
         service_name="codex-openai-ollama-proxy",
         service_version="0.1.0",
+        disable_copilot_adaptations=disable_copilot_adaptations,
     )
 
 
@@ -370,7 +372,92 @@ def test_openai_responses_passthrough_streams_when_backend_omits_content_type(
     assert response.text == backend_body
 
 
-def test_openai_responses_passthrough_suppresses_copilot_pre_tool_text(
+def test_openai_responses_passthrough_does_not_normalize_generic_stainless_stream(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'event: response.output_text.delta\n'
+        'data: {"type":"response.output_text.delta","delta":"I will check now"}\n\n'
+        'event: response.output_item.added\n'
+        'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_1","name":"bash"}}\n\n'
+        'data: [DONE]\n\n'
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(
+                200,
+                text=backend_body,
+                headers={"content-type": "text/event-stream; charset=utf-8"},
+            )
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content='{"model":"gpt-5.4","input":"hello","stream":true}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                    "User-Agent": "OpenAI/Python 1.0",
+                    "X-Stainless-Package-Version": "1.0.0",
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.text == backend_body
+
+
+def test_openai_responses_passthrough_keeps_copilot_compatible_stream_minimally_changed(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'event: response.reasoning_summary_text.delta\n'
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"Think first."}\n\n'
+        'event: response.output_text.delta\n'
+        'data: {"type":"response.output_text.delta","delta":"I will check now","output_index":0}\n\n'
+        'event: response.output_item.added\n'
+        'data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_1","name":"bash"}}\n\n'
+        'event: response.output_item.done\n'
+        'data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","status":"completed","arguments":"{\\"command\\":\\"du -sh .\\"}","call_id":"call_1","name":"bash"}}\n\n'
+        'event: response.completed\n'
+        'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"I will check now"}]},{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"bash","arguments":"{\\"command\\":\\"du -sh .\\"}"}]}}\n\n'
+        'data: [DONE]\n\n'
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(
+                200,
+                text=backend_body,
+                headers={"content-type": "text/event-stream; charset=utf-8"},
+            )
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content='{"model":"gpt-5.4","input":"hello","stream":true}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "Ucr/JS 5.20.1",
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.text == backend_body
+
+
+def test_openai_responses_passthrough_preserves_copilot_pre_tool_text(
     tmp_path: Path,
 ) -> None:
     auth_path = tmp_path / "auth.json"
@@ -420,14 +507,16 @@ def test_openai_responses_passthrough_suppresses_copilot_pre_tool_text(
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert "I will check now" not in response.text
+    assert "I will check now" in response.text
     assert "response.function_call_arguments.done" in response.text
     assert "du -sh ." in response.text
     assert '"output_index":1' in response.text
-    assert '"response":{"output":[{"id":"fc_1","type":"function_call"' in response.text
+    assert '"id":"msg_1"' in response.text
+    assert '"type":"message"' in response.text
+    assert '{"id":"fc_1","type":"function_call"' in response.text
 
 
-def test_openai_responses_passthrough_suppresses_vscode_copilot_reasoning_before_tools(
+def test_openai_responses_passthrough_preserves_vscode_copilot_reasoning_before_tools(
     tmp_path: Path,
 ) -> None:
     auth_path = tmp_path / "auth.json"
@@ -474,7 +563,7 @@ def test_openai_responses_passthrough_suppresses_vscode_copilot_reasoning_before
             )
 
     assert response.status_code == 200
-    assert "Optimized tool selection" not in response.text
+    assert "Optimized tool selection" in response.text
     assert "du -sh ." in response.text
     assert '"response":{"output":[{"id":"fc_1","type":"function_call"' in response.text
 
@@ -522,6 +611,88 @@ def test_openai_responses_passthrough_normalizes_copilot_tool_call_alias_events(
     assert "du -sh ." in response.text
     assert '"output_index":0' in response.text
     assert '"response":{"output":[{"id":"fc_1","type":"function_call"' in response.text
+
+
+def test_openai_responses_passthrough_backfills_missing_copilot_tool_output_index(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    backend_body = (
+        'event: response.output_item.added\n'
+        'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_1","name":"bash"}}\n\n'
+        'event: response.tool_call.arguments.done\n'
+        'data: {"type":"response.tool_call.arguments.done","call_id":"call_1","arguments":"{\\"command\\":\\"du -sh .\\"}"}\n\n'
+        'data: [DONE]\n\n'
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(
+                200,
+                text=backend_body,
+                headers={"content-type": "text/event-stream; charset=utf-8"},
+            )
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content='{"model":"gpt-5.4","input":"hello","stream":true}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "Ucr/JS 5.20.1",
+                },
+            )
+
+    assert response.status_code == 200
+    assert "response.tool_call.arguments.done" in response.text
+    assert '"output_index":0' in response.text
+    assert '"output_index":1' not in response.text
+
+
+def test_openai_responses_passthrough_disables_copilot_adaptations(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path, disable_copilot_adaptations=True)
+    app = create_app(settings)
+
+    backend_body = (
+        'event: response.output_item.added\n'
+        'data: {"type":"response.output_item.added","item":{"type":"function_call","arguments":"","name":"bash"}}\n\n'
+        'event: response.tool_call.arguments.done\n'
+        'data: {"type":"response.tool_call.arguments.done","call_id":"call_1","arguments":"{\\"command\\":\\"du -sh .\\"}"}\n\n'
+        'data: [DONE]\n\n'
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(
+                200,
+                text=backend_body,
+                headers={"content-type": "text/event-stream; charset=utf-8"},
+            )
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content='{"model":"gpt-5.4","input":"hello","stream":true}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "Ucr/JS 5.20.1",
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.text == backend_body
+    assert '"output_index"' not in response.text
+    assert '"id":"fc_1"' not in response.text
 
 
 def test_openai_responses_passthrough_backfills_completed_output_function_calls(

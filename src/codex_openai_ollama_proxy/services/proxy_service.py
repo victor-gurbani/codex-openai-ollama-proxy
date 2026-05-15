@@ -515,7 +515,11 @@ class ProxyService:
         request_body = normalize_responses_body_for_backend(
             request_body,
             default_effort="xhigh",
-            default_instructions=DEFAULT_SYSTEM_INSTRUCTIONS,
+            default_instructions=(
+                DEFAULT_SYSTEM_INSTRUCTIONS
+                if self._settings.add_default_responses_instructions
+                else None
+            ),
             base_models=base_models,
         )
         return await self._backend_client.open_responses_passthrough(
@@ -989,7 +993,7 @@ def normalize_responses_body_for_backend(
     request_body: bytes,
     *,
     default_effort: str,
-    default_instructions: str,
+    default_instructions: str | None,
     base_models: list[str] | None = None,
 ) -> bytes:
     try:
@@ -1002,9 +1006,10 @@ def normalize_responses_body_for_backend(
 
     updated_payload = dict(payload)
 
-    if not isinstance(updated_payload.get("instructions"), str) or not updated_payload.get(
-        "instructions", ""
-    ).strip():
+    if default_instructions is not None and (
+        not isinstance(updated_payload.get("instructions"), str)
+        or not updated_payload.get("instructions", "").strip()
+    ):
         updated_payload["instructions"] = default_instructions
 
     reasoning_effort = updated_payload.pop("reasoning_effort", None)

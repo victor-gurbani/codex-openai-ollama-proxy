@@ -19,7 +19,8 @@ def build_settings(
     auth_path: Path,
     *,
     debug: bool = False,
-    disable_copilot_adaptations: bool = False,
+    disable_copilot_adaptations: bool = True,
+    add_default_responses_instructions: bool = False,
     project_root: Path | None = None,
 ) -> Settings:
     return Settings(
@@ -31,6 +32,7 @@ def build_settings(
         service_name="codex-openai-ollama-proxy",
         service_version="0.1.0",
         disable_copilot_adaptations=disable_copilot_adaptations,
+        add_default_responses_instructions=add_default_responses_instructions,
     )
 
 
@@ -137,7 +139,6 @@ def test_openai_responses_passthrough_route_preserves_json_body_and_headers(
     assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
         "model": "gpt-5.4",
         "input": "hello",
-        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
         "reasoning": {"effort": "high"},
     }
     assert route.calls.last.request.headers["authorization"] == "Bearer backend_key"
@@ -174,9 +175,67 @@ def test_openai_responses_passthrough_defaults_missing_reasoning_to_xhigh(
     assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
         "model": "gpt-5.4",
         "input": "hello",
-        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
         "reasoning": {"effort": "xhigh"},
     }
+
+
+def test_openai_responses_passthrough_does_not_add_default_instructions_by_default(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(
+                200,
+                text='{"id":"resp_123"}',
+                headers={"content-type": "application/json"},
+            )
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content='{"model":"gpt-5.4","input":"hello"}',
+                headers={"Content-Type": "application/json"},
+            )
+
+    assert response.status_code == 200
+    forwarded_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert "instructions" not in forwarded_payload
+
+
+def test_openai_responses_passthrough_adds_default_instructions_when_enabled(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path, add_default_responses_instructions=True)
+    app = create_app(settings)
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(
+                200,
+                text='{"id":"resp_123"}',
+                headers={"content-type": "application/json"},
+            )
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content='{"model":"gpt-5.4","input":"hello"}',
+                headers={"Content-Type": "application/json"},
+            )
+
+    assert response.status_code == 200
+    forwarded_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert forwarded_payload["instructions"] == (
+        "You are a helpful AI assistant. Provide clear, accurate, and concise responses "
+        "to user questions and requests."
+    )
 
 
 def test_openai_responses_passthrough_defaults_empty_reasoning_effort_to_xhigh(
@@ -206,7 +265,6 @@ def test_openai_responses_passthrough_defaults_empty_reasoning_effort_to_xhigh(
     assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
         "model": "gpt-5.4",
         "input": "hello",
-        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
         "reasoning": {"summary": "auto", "effort": "xhigh"},
     }
 
@@ -331,7 +389,6 @@ def test_openai_responses_passthrough_route_preserves_sse_stream(tmp_path: Path)
     assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
         "model": "gpt-5.4",
         "input": "hello",
-        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
         "stream": True,
         "reasoning": {"effort": "high"},
     }
@@ -521,7 +578,7 @@ def test_openai_responses_passthrough_preserves_vscode_copilot_reasoning_before_
 ) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
-    settings = build_settings(auth_path)
+    settings = build_settings(auth_path, disable_copilot_adaptations=False)
     app = create_app(settings)
 
     backend_body = (
@@ -573,7 +630,7 @@ def test_openai_responses_passthrough_normalizes_copilot_tool_call_alias_events(
 ) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
-    settings = build_settings(auth_path)
+    settings = build_settings(auth_path, disable_copilot_adaptations=False)
     app = create_app(settings)
 
     backend_body = (
@@ -618,7 +675,7 @@ def test_openai_responses_passthrough_backfills_missing_copilot_tool_output_inde
 ) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
-    settings = build_settings(auth_path)
+    settings = build_settings(auth_path, disable_copilot_adaptations=False)
     app = create_app(settings)
 
     backend_body = (
@@ -700,7 +757,7 @@ def test_openai_responses_passthrough_backfills_completed_output_function_calls(
 ) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
-    settings = build_settings(auth_path)
+    settings = build_settings(auth_path, disable_copilot_adaptations=False)
     app = create_app(settings)
 
     backend_body = (
@@ -781,7 +838,6 @@ def test_openai_responses_passthrough_strips_backend_unsupported_generation_fiel
     assert json.loads(route.calls.last.request.content.decode("utf-8")) == {
         "model": "gpt-5.4",
         "input": [{"role": "user", "content": "hello"}],
-        "instructions": "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.",
         "stream": True,
         "reasoning": {"effort": "xhigh"},
     }

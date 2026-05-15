@@ -42,6 +42,12 @@ def normalize_bool(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def normalize_bool_default(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    return normalize_bool(value)
+
+
 def normalize_float(value: str | None, default: float) -> float:
     if value is None:
         return default
@@ -89,7 +95,8 @@ class Settings:
     service_name: str = "codex-openai-ollama-proxy"
     service_version: str = "0.1.0"
     ollama_compat_version: str = DEFAULT_OLLAMA_COMPAT_VERSION
-    disable_copilot_adaptations: bool = False
+    disable_copilot_adaptations: bool = True
+    add_default_responses_instructions: bool = False
     public_paths: frozenset[str] = field(
         default_factory=lambda: frozenset(
             {
@@ -146,8 +153,12 @@ class Settings:
             normalize_optional(os.getenv("OLLAMA_COMPAT_VERSION"))
             or DEFAULT_OLLAMA_COMPAT_VERSION
         )
-        disable_copilot_adaptations = normalize_bool(
-            os.getenv("DISABLE_COPILOT_ADAPTATIONS")
+        disable_copilot_adaptations = normalize_bool_default(
+            os.getenv("DISABLE_COPILOT_ADAPTATIONS"),
+            True,
+        )
+        add_default_responses_instructions = normalize_bool(
+            os.getenv("ADD_DEFAULT_RESPONSES_INSTRUCTIONS")
         )
 
         return cls(
@@ -164,4 +175,5 @@ class Settings:
             oauth_token_url=oauth_token_url,
             ollama_compat_version=ollama_compat_version,
             disable_copilot_adaptations=disable_copilot_adaptations,
+            add_default_responses_instructions=add_default_responses_instructions,
         )

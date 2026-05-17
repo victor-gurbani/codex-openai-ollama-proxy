@@ -144,7 +144,7 @@ def test_ollama_chat_streaming_emits_only_complete_tool_call_snapshot(tmp_path: 
     assert response.status_code == 200
     lines = [line for line in response.text.splitlines() if line.strip()]
 
-    tool_lines = [line for line in lines if '"tool_calls"' in line]
+    tool_lines = [line for line in lines if '"tool_calls":[' in line]
     assert len(tool_lines) == 1
     assert '"arguments":{"path":"."}' in tool_lines[0]
     assert '"type":"function"' not in tool_lines[0]
@@ -466,7 +466,7 @@ def test_ollama_chat_streaming_emits_final_tool_call_snapshot_once(tmp_path: Pat
     assert response.status_code == 200
     lines = [line for line in response.text.splitlines() if line.strip()]
 
-    tool_lines = [line for line in lines if '"tool_calls"' in line]
+    tool_lines = [line for line in lines if '"tool_calls":[' in line]
     assert len(tool_lines) == 1
     assert '"arguments":{"path":"."}' in tool_lines[0]
     assert '"type":"function"' not in tool_lines[0]

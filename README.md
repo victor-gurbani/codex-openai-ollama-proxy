@@ -5,10 +5,29 @@
 FastAPI-based proxy that exposes OpenAI-compatible and Ollama-compatible endpoints while using Codex/ChatGPT-backed authentication.
 
 This repository is actually working. It is not a mockup or placeholder project.  
-It supports tool use and is practical for real agentic coding workflows, with both "OpenAI Compatible" and "Ollama" API Provider configuration briefly tested to work on [Cline](https://cline.bot/).  
-Other coding agents have not been tested here, but clients that support standard OpenAI-compatible or Ollama-compatible connections will likely work as well.  
-Of course, it also works fine as a normal chat/completions API for general non-agent use.  
+It supports normal chat, streaming, reasoning controls, structured tool calling, OpenAI Responses passthrough, OpenAI-compatible chat completions, and Ollama-compatible chat/generate APIs.  
+That makes it useful for many AI coding agents and assistants, not just one specific client. It can be used from tools that speak OpenAI-compatible APIs, tools that speak Ollama-compatible APIs, and direct API clients that need structured function/tool calls.  
 It has been tested on Windows and Apple Silicon Mac.
+
+## Client Compatibility
+
+The proxy is designed for agentic coding workflows and assistant clients that can point at a custom OpenAI-compatible or Ollama-compatible base URL.
+
+Known useful client categories include:
+
+- OpenAI-compatible coding agents such as Cline, Roo Code, Continue, and similar IDE assistants
+- GitHub Copilot-style clients that use OpenAI Responses or chat-completion-style wire formats
+- Raycast AI and other desktop assistants that use Ollama/OpenAI-style chat APIs with tools
+- the actual `ollama` CLI and Ollama-aware apps through `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, and related endpoints
+- custom scripts or backend services that need structured tool/function calling through OpenAI-compatible chat completions
+- direct OpenAI Responses API clients that want a mostly passthrough `/v1/responses` endpoint backed by Codex authentication
+
+Compatibility is implemented at two levels:
+
+- **OpenAI-compatible mode** exposes `/v1/chat/completions`, `/v1/responses`, `/models`, and related routes for agents that expect OpenAI-style APIs.
+- **Ollama-compatible mode** exposes `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, and related routes for clients that normally talk to a local Ollama server.
+
+The goal is protocol compatibility rather than client-specific hacks. For example, `/v1/responses` stays a passthrough-style route, while the chat/Ollama adapters normalize only the request shapes that must be translated before sending them to the Codex backend.
 
 **Prerequisite: Codex must already be installed and logged in on the machine, and a valid `auth.json` must already exist before you run this proxy. The default expected location is `~/.codex/auth.json`. Without that file, this proxy cannot authenticate to the Codex backend.**
 
@@ -137,6 +156,13 @@ Ollama-compatible:
 - `GET /api/ps`
 - `POST /api/chat`
 - `POST /api/generate`
+
+Client-oriented compatibility endpoints:
+
+- `/v1/chat/completions` and `/chat/completions` support standard chat-completion request shapes, streaming, and structured tool calls.
+- `/v1/responses` and `/responses` are intended for Responses-compatible clients, including Copilot-like clients that already speak that wire format.
+- `/api/chat` and `/api/generate` are intended for Ollama-compatible clients, including the native `ollama` CLI when pointed at this proxy's host and port.
+- `/api/tags`, `/api/show`, `/api/version`, and `/api/ps` provide the discovery metadata many Ollama clients probe before sending chat requests.
 
 `GET /api/ps` is a compatibility endpoint for Ollama-aware clients. Unlike a real local Ollama runtime, this proxy does not know actual loaded-model residency or VRAM usage, so some fields are synthetic:
 

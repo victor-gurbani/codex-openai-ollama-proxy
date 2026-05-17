@@ -470,7 +470,10 @@ class ProxyService:
             reasoning,
             chat_req.temperature,
         )
-        converted_tools = convert_chat_tools_to_responses(chat_req.tools)
+        converted_tools = convert_chat_tools_to_responses(
+            chat_req.tools,
+            include_client_tool_types=True,
+        )
         if should_force_finalize_without_tools(chat_req):
             converted_tools = []
         converted_tool_choice = convert_tool_choice(chat_req.tool_choice)

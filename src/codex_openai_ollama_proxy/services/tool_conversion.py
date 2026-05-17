@@ -35,8 +35,8 @@ def parse_function_arguments(arguments: str) -> Any:
 
 def convert_chat_tool_call_to_ollama(tool_call: Any, *, index: int | None = None) -> dict[str, Any]:
     function_payload: dict[str, Any] = {
-            "name": tool_call.function.name,
-            "arguments": parse_function_arguments(tool_call.function.arguments),
+        "name": tool_call.function.name,
+        "arguments": parse_function_arguments(tool_call.function.arguments),
     }
     if index is not None:
         function_payload["index"] = index
@@ -55,10 +55,22 @@ def convert_chat_tool_calls_to_ollama(tool_calls: list[Any] | None) -> list[dict
     ]
 
 
-def convert_chat_tools_to_responses(tools: list[Any] | None) -> list[Any]:
+def convert_chat_tools_to_responses(
+    tools: list[Any] | None,
+    *,
+    include_client_tool_types: bool = False,
+) -> list[Any]:
     converted_tools: list[Any] = []
+    supported_types = {"function"}
+    if include_client_tool_types:
+        supported_types.update({"local_tool", "remote_tool"})
     for tool in tools or []:
-        if not isinstance(tool, dict) or tool.get("type") != "function":
+        if not isinstance(tool, dict):
+            converted_tools.append(tool)
+            continue
+
+        tool_type = tool.get("type")
+        if tool_type not in supported_types:
             converted_tools.append(tool)
             continue
 
@@ -69,9 +81,9 @@ def convert_chat_tools_to_responses(tools: list[Any] | None) -> list[Any]:
             continue
 
         converted: dict[str, Any] = {"type": "function", "name": name}
-        description = (function_obj or {}).get("description") or tool.get("description")
-        parameters = (function_obj or {}).get("parameters") or tool.get("parameters")
-        strict = (function_obj or {}).get("strict") or tool.get("strict")
+        description = first_present(function_obj, tool, "description")
+        parameters = first_present(function_obj, tool, "parameters")
+        strict = first_present(function_obj, tool, "strict")
         if description is not None:
             converted["description"] = description
         if parameters is not None:
@@ -81,6 +93,12 @@ def convert_chat_tools_to_responses(tools: list[Any] | None) -> list[Any]:
         converted_tools.append(converted)
 
     return converted_tools
+
+
+def first_present(primary: dict[str, Any] | None, fallback: dict[str, Any], key: str) -> Any:
+    if primary is not None and key in primary:
+        return primary[key]
+    return fallback.get(key)
 
 
 def convert_tool_choice(tool_choice: Any) -> Any:

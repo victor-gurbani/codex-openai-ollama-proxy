@@ -893,6 +893,49 @@ def test_openai_responses_passthrough_flattens_nested_function_tools(
     ]
 
 
+def test_openai_responses_passthrough_preserves_client_specific_tool_types(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    request_tools = [
+        {"name": "web_search", "type": "remote_tool"},
+        {
+            "function": {
+                "description": "Gets the user's current location.",
+                "name": "location-get-current-location",
+                "parameters": {},
+            },
+            "type": "local_tool",
+        },
+    ]
+    request_body = json.dumps(
+        {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "tools": request_tools,
+        }
+    )
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        route = respx_mock.post(settings.backend_responses_url).mock(
+            return_value=Response(200, text='{"id":"resp_123"}', headers={"content-type": "application/json"})
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                content=request_body,
+                headers={"Content-Type": "application/json"},
+            )
+
+    assert response.status_code == 200
+    backend_payload = json.loads(route.calls.last.request.content.decode("utf-8"))
+    assert backend_payload["tools"] == request_tools
+
+
 def test_openai_responses_passthrough_adds_default_name_to_json_schema_text_format(
     tmp_path: Path,
 ) -> None:

@@ -191,6 +191,115 @@ def test_convert_messages_to_input_tool_name_handles_duplicate_calls_fifo() -> N
     assert instructions
 
 
+def test_convert_messages_to_input_drops_unanswered_assistant_tool_call() -> None:
+    messages = [
+        ChatMessage(role="user", content="What is the latest inflation rate?"),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ChatMessageToolCall(
+                    id=None,
+                    type="function",
+                    function=ChatMessageToolFunction(name="web_search", arguments={}),
+                )
+            ],
+        ),
+    ]
+
+    input_items, instructions = convert_messages_to_input(messages)
+
+    assert input_items == [
+        {
+            "type": "message",
+            "id": None,
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "What is the latest inflation rate?"}
+            ],
+        }
+    ]
+    assert instructions
+
+
+def test_convert_messages_to_input_keeps_answered_tool_call_and_drops_unanswered_one() -> None:
+    messages = [
+        ChatMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[
+                ChatMessageToolCall(
+                    id="call_answered",
+                    type="function",
+                    function=ChatMessageToolFunction(name="lookup", arguments={"id": 1}),
+                ),
+                ChatMessageToolCall(
+                    id="call_unanswered",
+                    type="function",
+                    function=ChatMessageToolFunction(name="lookup", arguments={"id": 2}),
+                ),
+            ],
+        ),
+        ChatMessage(role="tool", tool_call_id="call_answered", content="result"),
+    ]
+
+    input_items, instructions = convert_messages_to_input(messages)
+
+    assert input_items == [
+        {
+            "type": "function_call",
+            "id": None,
+            "call_id": "call_answered",
+            "name": "lookup",
+            "arguments": '{"id":1}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_answered",
+            "name": "lookup",
+            "output": "result",
+        },
+    ]
+    assert instructions
+
+
+def test_convert_messages_to_input_keeps_raycast_tool_output_without_ids() -> None:
+    messages = [
+        ChatMessage(role="user", content="get my location"),
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ChatMessageToolCall(
+                    id=None,
+                    type="function",
+                    function=ChatMessageToolFunction(
+                        name="location-get-current-location",
+                        arguments={},
+                    ),
+                )
+            ],
+        ),
+        ChatMessage(
+            role="tool",
+            content={"city": "Madrid", "country": "Spain"},
+        ),
+    ]
+
+    input_items, instructions = convert_messages_to_input(messages)
+
+    assert len(input_items) == 3
+    assert input_items[1]["type"] == "function_call"
+    assert input_items[1]["name"] == "location-get-current-location"
+    assert input_items[2] == {
+        "type": "function_call_output",
+        "call_id": input_items[1]["call_id"],
+        "name": "location-get-current-location",
+        "output": '{"city":"Madrid","country":"Spain"}',
+    }
+    assert instructions
+
+
 def test_convert_messages_to_input_replays_assistant_thinking_before_content() -> None:
     messages = [
         ChatMessage(

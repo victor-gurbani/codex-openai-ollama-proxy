@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 from typing import Any
 
 from codex_openai_ollama_proxy.core.config import DEFAULT_SYSTEM_INSTRUCTIONS
@@ -28,6 +29,17 @@ def extract_content_text(content: Any) -> str:
     if content is None:
         return ""
     return str(content)
+
+
+def serialize_tool_output(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(content)
 
 
 def extract_reasoning_text(message: ChatMessage) -> str:
@@ -184,7 +196,11 @@ def convert_messages_to_input(
 
         if role.lower() == "tool":
             input_items.append(
-                tool_message_to_output(message, pending_tool_calls, content_text)
+                tool_message_to_output(
+                    message,
+                    pending_tool_calls,
+                    serialize_tool_output(message.content),
+                )
             )
             continue
 
@@ -199,7 +215,23 @@ def convert_messages_to_input(
                 }
             )
 
+    input_items = prune_unmatched_function_calls(input_items)
     instructions = (
         "\n\n".join(system_instructions) if system_instructions else default_instructions
     )
     return input_items, instructions
+
+
+def prune_unmatched_function_calls(input_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output_call_ids = {
+        item.get("call_id")
+        for item in input_items
+        if item.get("type") == "function_call_output" and isinstance(item.get("call_id"), str)
+    }
+    if not output_call_ids:
+        return [item for item in input_items if item.get("type") != "function_call"]
+    return [
+        item
+        for item in input_items
+        if item.get("type") != "function_call" or item.get("call_id") in output_call_ids
+    ]

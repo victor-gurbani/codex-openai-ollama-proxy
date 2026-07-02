@@ -567,6 +567,38 @@ def test_api_tags_advertises_vision_when_backend_metadata_supports_images(
     ]
 
 
+def test_api_tags_includes_context_length_in_details_from_backend_catalog(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})
+    settings = build_settings(auth_path)
+    app = create_app(settings)
+
+    catalog_body = {
+        "models": [
+            {
+                "slug": "gpt-5.4",
+                "display_name": "GPT-5.4",
+                "context_window": 272000,
+            }
+        ]
+    }
+
+    with respx.mock(assert_all_called=True) as respx_mock:
+        respx_mock.get(settings.backend_models_url).mock(
+            return_value=Response(200, json=catalog_body)
+        )
+        with TestClient(app) as client:
+            response = client.get("/api/tags")
+
+    assert response.status_code == 200
+    payload = response.json()
+    models = {item["model"]: item for item in payload["models"]}
+    assert models["gpt-5.4"]["details"]["context_length"] == 272000
+    assert models["gpt-5.4-high"]["details"]["context_length"] == 272000
+
+
 def test_ollama_show_uses_codex_family_key_for_codex_models(tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     write_auth_file(auth_path, {"OPENAI_API_KEY": "backend_key"})

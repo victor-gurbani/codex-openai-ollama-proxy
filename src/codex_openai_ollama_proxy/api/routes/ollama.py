@@ -298,6 +298,10 @@ async def ollama_tags(
     payload_models: list[dict[str, object]] = []
     for model in models:
         metadata = await model_catalog.get_model_metadata_for_request(model)
+        details = ollama_model_details(model, metadata)
+        context_length = metadata_context_length(metadata)
+        if context_length is not None:
+            details["context_length"] = context_length
         payload_models.append(
             {
                 "name": model,
@@ -305,7 +309,7 @@ async def ollama_tags(
                 "modified_at": SYNTHETIC_MODEL_MODIFIED_AT,
                 "size": SYNTHETIC_MODEL_SIZE_BYTES,
                 "digest": synthetic_model_digest(model),
-                "details": ollama_model_details(model, metadata),
+                "details": details,
                 "capabilities": ollama_model_capabilities(metadata),
             }
         )
